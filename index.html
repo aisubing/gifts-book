@@ -713,7 +713,7 @@
                 <div class="flex items-center justify-between bg-gray-100 p-3 rounded-lg">
                   <span class="font-medium text-gray-700">语音播报</span>
                   <label for="speech-toggle" class="relative inline-flex items-center cursor-pointer">
-                    <input type="checkbox" id="speech-toggle" class="sr-only peer" checked />
+                    <input type="checkbox" id="speech-toggle" class="sr-only peer" />
                     <div
                       class="toggle-bg w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"
                     ></div>
@@ -4373,7 +4373,7 @@
           this.currentPassword = null;
           this.gifts = [];
           this.currentPage = 1;
-          this.isSpeechEnabled = true;
+          this.isSpeechEnabled = false; // 语音播报默认关闭，可在界面开关打开
           this.totalAmountCache = 0;
           this.totalGiversCache = 0;
           this.cachedStats = null;
