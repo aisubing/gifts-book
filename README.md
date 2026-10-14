@@ -128,37 +128,30 @@
 
 ```
 # 克隆项目
-git clone https://github.com/jingguanzhang/gift-book.git
+git clone https://github.com/aisubing/gifts-book.git
 
 # 进入目录
-cd gift-book
+cd gifts-book
 ```
 
 ### 2. 环境准备
 
-你只需要一个代码编辑器（推荐 **VS Code**）和一个现代浏览器（Chrome/Edge）。
+需要 [Go](https://go.dev/dl/)（编译本地服务器）和一个代码编辑器（推荐 **VS Code**）。应用强制通过自带服务器运行（数据安全闸门），双击 `index.html` 无法进入系统。
 
 ### 3. 启动开发
 
-虽然直接双击 `index.html` 可以运行，但为了避免浏览器的安全策略限制（如本地文件访问限制、模块加载跨域等），**强烈建议使用本地静态服务器**运行。
+```bash
+# 编译并运行本地服务器（Windows 下生成 .exe）
+cd server && go build -o gifts-book-server.exe . && ./gifts-book-server.exe
+# 自动打开浏览器；或手动访问 http://localhost:8765
+```
 
-* **方式一（推荐）：VS Code Live Server**
-  
-  1. 安装 VS Code 插件：[Live Server](https://marketplace.visualstudio.com/items?itemName=ritwickdey.LiveServer)。
-  2. 右键选择 **"Open with Live Server"**。
-  3. 
-* **方式二：Python (Mac/Linux/Win)**
-  在项目根目录下打开终端，运行：
-  
-  ```bash
-  # Python 3
-  python -m http.server
-  # 访问 http://localhost:8000
-  ```
+修改 `index.html` / `static/` 后刷新浏览器即可生效；修改 `server/main.go` 后重新编译。
 
 ### 4. 项目结构
 
-* `index.html`: **v1.1 专业版**主入口（核心代码均内嵌于此）。
+* `index.html`: 主入口（核心代码均内嵌于此）。
+* `server/`: 本地服务器（数据落盘 API + 静态伺服）。
 * `static/`: 静态资源目录。
   * `tailwindcss.js`: 样式引擎。
   * `xlsx.full.min.js`: Excel 导出库。
@@ -167,12 +160,9 @@ cd gift-book
   * `fontkit` & `.ttf`: 字体文件（用于 PDF 生成）。
 * `guest-screen.html`: 副屏显示页面。
 
-### 5. 部署上线
+### 5. 部署说明
 
-本项目是纯静态资源，部署非常简单：
-
-* **直接上传**：将所有文件上传至 GitHub Pages、Vercel、Nginx 或任何静态文件服务器。
-* **无需编译**：不需要执行 `build` 命令，源码即产物。
+本应用为**本地应用**，不支持部署到 GitHub Pages / Vercel 等云端静态托管（数据落盘 API 必须与本机文件系统配合，且仅接受本机访问）。在单台电脑上通过 `gifts-book-server.exe` 使用即是设计形态。
 
 
 ---
