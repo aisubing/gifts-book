@@ -464,12 +464,18 @@
 
         async storeImage(key, file) {
           try {
+            if (!("caches" in window)) {
+              console.warn("当前环境不支持 Cache API（需 localhost 或 https），收款码无法持久保存");
+              return false;
+            }
             const cache = await caches.open(this.CACHE_NAME);
             const response = new Response(file);
             await cache.put(key, response);
             console.log(`Image ${key} stored in cache.`);
+            return true;
           } catch (error) {
             console.error(`Failed to store image ${key}:`, error);
+            return false;
           }
         },
 
@@ -520,6 +526,18 @@
         },
       };
 
+      // 工具函数：HTML 转义（姓名/金额等数据拼入 innerHTML 前必须转义）
+      function escapeHtml(value) {
+        if (value === null || value === undefined) return "";
+        return String(value).replace(/[&<>"']/g, (ch) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[ch]);
+      }
+
       // 工具函数：隐藏姓名
       function maskName(name, hidePrivacy, isLatest) {
         if (!hidePrivacy || isLatest) {
@@ -527,7 +545,7 @@
         }
         const nameLength = name.length;
         if (nameLength <= 1) return name;
-        if (nameLength === 2) return name[0] + "**";
+        if (nameLength === 2) return name[0] + "*";
         if (nameLength === 3) return name[0] + "**";
         return name.substring(0, 2) + "**";
       }
@@ -536,6 +554,10 @@
       class GuestScreen {
         constructor() {
           this.currentData = null;
+          this.lastHeartbeatAt = 0;
+          this.heartbeatWatchTimer = null;
+          // file:// 协议下 origin 为 "null"，postMessage 不接受该值，只能退回 "*"
+          this.targetOrigin = window.location.origin && window.location.origin !== "null" ? window.location.origin : "*";
           this.cacheDOMElements();
         }
 
@@ -572,9 +594,58 @@
 
         init() {
           window.addEventListener("message", (e) => this.handleMessage(e));
-          window.opener?.postMessage({ type: "guest_screen_ready" }, "*");
+
+          if (window.opener) {
+            window.opener.postMessage({ type: "guest_screen_ready" }, this.targetOrigin);
+          } else {
+            // 直接打开（非主屏唤起）时提示等待，并周期性重试握手
+            this.eventTitle.textContent = "等待主屏连接…";
+            this.appContainer.classList.remove("hidden");
+          }
+          // 握手重试：主屏可能晚于副屏就绪
+          this.readyRetryTimer = setInterval(() => {
+            if (this.currentData || !window.opener) return;
+            try {
+              window.opener.postMessage({ type: "guest_screen_ready" }, this.targetOrigin);
+            } catch (e) {
+              /* opener 可能已关闭，忽略 */
+            }
+          }, 2000);
+
           this.bindControlEvents();
           this.loadAndApplySettings();
+          this.startHeartbeatWatch();
+        }
+
+        /**
+         * 心跳超时监测：主屏关闭/崩溃后副屏停留在旧画面且无任何提示
+         * 超过阈值未收到心跳/更新时显示"连接已断开"遮罩
+         */
+        startHeartbeatWatch() {
+          if (this.heartbeatWatchTimer) clearInterval(this.heartbeatWatchTimer);
+          this.heartbeatWatchTimer = setInterval(() => {
+            if (!this.currentData || !this.lastHeartbeatAt) return;
+            const silentMs = Date.now() - this.lastHeartbeatAt;
+            if (silentMs > 75000) {
+              this.showDisconnectOverlay(true);
+            }
+          }, 10000);
+        }
+
+        showDisconnectOverlay(show) {
+          let overlay = document.getElementById("disconnect-overlay");
+          if (!show) {
+            if (overlay) overlay.remove();
+            return;
+          }
+          if (overlay) return;
+          overlay = document.createElement("div");
+          overlay.id = "disconnect-overlay";
+          overlay.style.cssText =
+            "position:fixed;inset:0;background:rgba(0,0,0,0.72);color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:2000;font-size:clamp(18px,2.5vw,32px);letter-spacing:4px;";
+          overlay.innerHTML =
+            '<p style="margin:0 0 12px;">⚠ 与主屏的连接已断开</p><p style="margin:0;font-size:0.6em;opacity:0.8;">当前画面已停止更新，请检查主屏窗口</p>';
+          document.body.appendChild(overlay);
         }
 
         bindControlEvents() {
@@ -601,12 +672,18 @@
         }
 
         handleMessage(event) {
+          // 安全校验：file:// 之外仅接受同源且来自父窗口的消息，防止任意页面伪造消息注入内容
+          if (this.targetOrigin !== "*" && event.origin !== this.targetOrigin) return;
+          if (window.opener && event.source !== window.opener) return;
           const { type, data } = event.data || {};
+          this.lastHeartbeatAt = Date.now();
           switch (type) {
             case "guest_screen_update":
+              this.showDisconnectOverlay(false);
               this.updateDisplay(data);
               break;
             case "guest_screen_heartbeat":
+              this.showDisconnectOverlay(false);
               break;
           }
         }
@@ -621,19 +698,25 @@
         }
 
         renderGiftBook(data) {
-          const { gifts, hidePrivacy, typeText } = data;
-          const ITEMS_PER_PAGE = 12;
+          const { hidePrivacy, typeText } = data;
+          const gifts = Array.isArray(data.gifts) ? data.gifts : [];
+          // 每页条数跟随主屏配置（6~24），布局栅格随之调整；缺省回退 12
+          const itemsPerPage = Math.min(Math.max(parseInt(data.itemsPerPage) || 12, 4), 24);
           const latestGiftId = gifts[gifts.length - 1]?.id;
           const displayGifts = [...gifts];
-          while (displayGifts.length < ITEMS_PER_PAGE) {
+          while (displayGifts.length < itemsPerPage) {
             displayGifts.push(null);
           }
+          const gridColumnStyle = `repeat(${itemsPerPage}, minmax(0, 1fr))`;
           const nameRow = document.createElement("div");
           nameRow.className = "gift-book-row";
+          nameRow.style.gridTemplateColumns = gridColumnStyle;
           const typeRow = document.createElement("div");
           typeRow.className = "gift-book-row";
+          typeRow.style.gridTemplateColumns = gridColumnStyle;
           const amountRow = document.createElement("div");
           amountRow.className = "gift-book-row";
+          amountRow.style.gridTemplateColumns = gridColumnStyle;
           displayGifts.forEach((gift) => {
             const nameCell = document.createElement("div");
             nameCell.className = "book-cell name-cell";
@@ -641,7 +724,7 @@
               const isLatest = gift.id === latestGiftId;
               const displayName = maskName(gift.name, hidePrivacy, isLatest);
               const formattedName = displayName.length === 2 ? `${displayName[0]}\u3000${displayName[1]}` : displayName;
-              nameCell.innerHTML = `<div class="name ${displayName.length > 4 ? "scale" : ""}">${formattedName}</div>`;
+              nameCell.innerHTML = `<div class="name ${displayName.length > 4 ? "scale" : ""}">${escapeHtml(formattedName)}</div>`;
               if (isLatest) nameCell.classList.add("latest-entry");
             }
             nameRow.appendChild(nameCell);
@@ -652,10 +735,10 @@
             const amountCell = document.createElement("div");
             amountCell.className = "book-cell amount-cell";
             if (gift) {
-              const amountChinese = gift.amountChinese;
+              const amountChinese = gift.amountChinese || "";
               amountCell.innerHTML = `
-                <div class="amount-chinese ${amountChinese.length > 16 ? "scale" : ""}">${amountChinese}</div>
-                <div class="amount-numeric ${Math.abs(gift.amount).toString().length > 8 ? "scale" : ""}">￥${gift.amount}</div>
+                <div class="amount-chinese ${amountChinese.length > 16 ? "scale" : ""}">${escapeHtml(amountChinese)}</div>
+                <div class="amount-numeric ${Math.abs(gift.amount).toString().length > 8 ? "scale" : ""}">￥${escapeHtml(gift.amount)}</div>
               `;
               if (gift.id === latestGiftId) amountCell.classList.add("latest-entry");
             }
@@ -674,20 +757,23 @@
           const hasContent = !!alipayBlob || !!wechatBlob || (customText && customText.trim() !== "");
           this.applyLayout(settings.layout, hasContent);
 
-          if (alipayBlob) {
-            this.qrAlipayImg.src = URL.createObjectURL(alipayBlob);
-            this.qrAlipayContainer.style.display = "flex";
-          } else {
-            this.qrAlipayImg.src = "";
-            this.qrAlipayContainer.style.display = "none";
-          }
-          if (wechatBlob) {
-            this.qrWechatImg.src = URL.createObjectURL(wechatBlob);
-            this.qrWechatContainer.style.display = "flex";
-          } else {
-            this.qrWechatImg.src = "";
-            this.qrWechatContainer.style.display = "none";
-          }
+          // 复用前先释放旧的 blob URL，避免长期使用累积泄漏
+          this._qrBlobUrls = this._qrBlobUrls || { alipay: null, wechat: null };
+          const setQrImage = (imgEl, containerEl, blob, key) => {
+            if (this._qrBlobUrls[key]) URL.revokeObjectURL(this._qrBlobUrls[key]);
+            this._qrBlobUrls[key] = null;
+            if (blob) {
+              const url = URL.createObjectURL(blob);
+              this._qrBlobUrls[key] = url;
+              imgEl.src = url;
+              containerEl.style.display = "flex";
+            } else {
+              imgEl.src = "";
+              containerEl.style.display = "none";
+            }
+          };
+          setQrImage(this.qrAlipayImg, this.qrAlipayContainer, alipayBlob, "alipay");
+          setQrImage(this.qrWechatImg, this.qrWechatContainer, wechatBlob, "wechat");
           this.customTextDisplay.innerHTML = customText;
         }
 
@@ -772,6 +858,8 @@
 
           if (!window.pell) {
             console.error("Pell.js 未加载!");
+            alert("富文本组件加载失败，请检查网络后刷新重试。");
+            this.closeSettingsModal();
             return;
           }
 
@@ -802,7 +890,8 @@
           colorInput.type = "color";
           colorInput.className = "custom-pell-color";
           colorInput.title = "文字颜色";
-          colorInput.value = "var(--primary-color)";
+          // color 输入框不接受 CSS 变量，需解析为具体色值（否则浏览器回退为 #000000 显示为黑色）
+          colorInput.value = getComputedStyle(document.body).getPropertyValue("--primary-color").trim() || "#cc0000";
           colorInput.onchange = () => {
             window.pell.exec("foreColor", colorInput.value);
             editor.content.focus();
@@ -880,16 +969,17 @@
         async handleSaveSettings(editor) {
           try {
             // 1. 根据标记和新文件更新图片
+            let imageStoreFailed = false;
             if (this.alipayCleared) {
               await CacheManager.deleteImage("alipay-qr");
             } else if (this.pendingAlipayFile) {
-              await CacheManager.storeImage("alipay-qr", this.pendingAlipayFile);
+              imageStoreFailed = !(await CacheManager.storeImage("alipay-qr", this.pendingAlipayFile)) || imageStoreFailed;
             }
 
             if (this.wechatCleared) {
               await CacheManager.deleteImage("wechat-qr");
             } else if (this.pendingWechatFile) {
-              await CacheManager.storeImage("wechat-qr", this.pendingWechatFile);
+              imageStoreFailed = !(await CacheManager.storeImage("wechat-qr", this.pendingWechatFile)) || imageStoreFailed;
             }
 
             // 2. 保存布局和文字
@@ -902,6 +992,11 @@
 
             // 4. 关闭弹窗
             this.closeSettingsModal();
+
+            // 5. 非安全上下文（file:// 或内网 http）下 Cache API 不可用，明确告知用户
+            if (imageStoreFailed) {
+              alert("注意：当前环境不支持持久保存收款码图片（需 localhost 或 https 访问），刷新后需重新上传。");
+            }
           } catch (error) {
             console.error("保存设置失败:", error);
             alert("保存设置失败，请重试。");
@@ -913,7 +1008,7 @@
       guestScreen.init();
 
       document.addEventListener("keydown", (e) => {
-        if (e.target.closest(".pell-content")) return;
+        if (e.target instanceof Element && e.target.closest(".pell-content")) return;
         if (e.key === "F11") {
           e.preventDefault();
           if (!document.fullscreenElement) {
@@ -925,6 +1020,11 @@
           }
         }
         if (e.key === "Escape" && !document.fullscreenElement) {
+          // 设置弹窗打开时，Esc 仅关闭设置弹窗，而不是询问关闭整个副屏
+          if (!guestScreen.modalContainer.classList.contains("hidden")) {
+            guestScreen.closeSettingsModal();
+            return;
+          }
           if (confirm("确定要关闭副屏吗？")) {
             window.close();
           }

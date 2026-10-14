@@ -617,7 +617,7 @@
                 </div>
               </div>
             </div>
-            <input type="text" id="admin-password" placeholder="设置管理密码 (请牢记)" required class="w-full p-3 border rounded-lg focus:ring-2 themed-ring" />
+            <input type="password" id="admin-password" placeholder="设置管理密码 (请牢记)" required autocomplete="new-password" class="w-full p-3 border rounded-lg focus:ring-2 themed-ring" />
 
             <details class="group">
               <summary class="cursor-pointer text-sm font-medium text-gray-600 group-hover:text-gray-900 list-none">
@@ -846,10 +846,28 @@
          * @returns {string} 中文大写金额字符串
          * @example
          */
+        /**
+         * HTML 转义 - 防止用户输入（姓名/备注等）被当作 HTML 执行
+         * 所有将用户数据拼入 innerHTML 的位置必须先经过此方法
+         * @param {*} value - 任意值，非字符串会先转为字符串
+         * @returns {string} 转义后的安全文本
+         */
+        static escapeHtml(value) {
+          if (value === null || value === undefined) return "";
+          return String(value).replace(/[&<>"']/g, (ch) => ({
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#39;",
+          })[ch]);
+        }
+
         static amountToChinese(n) {
           if (typeof n !== "number" && typeof n !== "string") return "";
           n = parseFloat(n);
           if (isNaN(n) || n === null) return "";
+          if (n < 0) return "金额无效";
           if (n === 0) return "零元整";
 
           let unit = "京亿万仟佰拾兆万仟佰拾亿仟佰拾万仟佰拾元角分";
@@ -932,11 +950,11 @@
         /**
          * 生成用于文件名的时间戳
          * @param {Date} date
-         * @returns {string} yyyy-mm-dd hh:mm:ss
+         * @returns {string} yyyy-mm-dd_hh-mm-ss（不含空格与冒号，Windows/macOS 文件名均合法）
          */
         static formatTimestampForFilename(date = new Date()) {
           const pad = (num) => num.toString().padStart(2, "0");
-          return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+          return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
         }
 
         /**
@@ -1101,9 +1119,15 @@
           const transaction = this.db.transaction(storeName, "readwrite");
           const store = transaction.objectStore(storeName);
           return new Promise((resolve, reject) => {
+            let newId = null;
             const request = store.add(data);
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+              newId = request.result;
+            };
+            // 等待事务真正提交后再 resolve，避免事务随后 abort（如配额满）造成"假成功"
+            transaction.oncomplete = () => resolve(newId);
+            transaction.onerror = () => reject(transaction.error || request.error);
+            transaction.onabort = () => reject(transaction.error || request.error);
           });
         }
 
@@ -1151,8 +1175,10 @@
           const store = transaction.objectStore(storeName);
           return new Promise((resolve, reject) => {
             const request = store.put(data);
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
+            // 等待事务真正提交后再 resolve，避免事务 abort（如配额满）造成"假成功"
+            transaction.oncomplete = () => resolve(request.result);
+            transaction.onerror = () => reject(transaction.error || request.error);
+            transaction.onabort = () => reject(transaction.error || request.error);
           });
         }
 
@@ -1163,8 +1189,80 @@
           const store = transaction.objectStore(storeName);
           return new Promise((resolve, reject) => {
             const request = store.delete(key);
-            request.onsuccess = () => resolve();
-            request.onerror = () => reject(request.error);
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error || request.error);
+            transaction.onabort = () => reject(transaction.error || request.error);
+          });
+        }
+
+        /**
+         * 批量原子操作 - 在单个事务内删除事项全部礼金并写入新记录
+         * 用于备份导入（替换模式）与删除事项，保证"清空+写入"要么全部成功、要么全部回滚，
+         * 避免逐条独立事务在部分失败后造成旧数据已删、新数据不完整的永久丢失
+         * @param {number} eventId - 事项 ID
+         * @param {Array<Object>} giftRecords - 待写入的礼金记录（不含 eventId，会自动补充）
+         * @param {boolean} clearFirst - 是否先清空该事项的全部旧记录
+         * @returns {Promise<number>} 实际写入的记录数
+         */
+        replaceGiftsForEvent(eventId, giftRecords, clearFirst) {
+          return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction("gifts", "readwrite");
+            const store = transaction.objectStore("gifts");
+            let written = 0;
+            // 注意：必须等删除游标完全耗尽后再发起写入，
+            // 否则同事务内新写入的同 eventId 记录会被游标遍历到并误删
+            const writeRecords = () => {
+              for (const record of giftRecords) {
+                store.add({ ...record, eventId });
+                written++;
+              }
+            };
+
+            if (clearFirst) {
+              const index = store.index("eventId");
+              const cursorRequest = index.openCursor(IDBKeyRange.only(eventId));
+              cursorRequest.onsuccess = (event) => {
+                const cursor = event.target.result;
+                if (cursor) {
+                  cursor.delete();
+                  cursor.continue();
+                } else {
+                  writeRecords();
+                }
+              };
+            } else {
+              writeRecords();
+            }
+
+            transaction.oncomplete = () => resolve(written);
+            transaction.onerror = () => reject(transaction.error);
+            transaction.onabort = () => reject(transaction.error);
+          });
+        }
+
+        /**
+         * 批量删除指定事项的全部礼金记录（单事务，用于删除事项）
+         * @param {number} eventId - 事项 ID
+         * @returns {Promise<number>} 删除的记录数
+         */
+        deleteGiftsByEvent(eventId) {
+          return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction("gifts", "readwrite");
+            const store = transaction.objectStore("gifts");
+            const index = store.index("eventId");
+            let deleted = 0;
+            const cursorRequest = index.openCursor(IDBKeyRange.only(eventId));
+            cursorRequest.onsuccess = (event) => {
+              const cursor = event.target.result;
+              if (cursor) {
+                cursor.delete();
+                deleted++;
+                cursor.continue();
+              }
+            };
+            transaction.oncomplete = () => resolve(deleted);
+            transaction.onerror = () => reject(transaction.error);
+            transaction.onabort = () => reject(transaction.error);
           });
         }
       }
@@ -1248,14 +1346,17 @@
          *   - keepOpen: 是否保持弹窗打开（默认关闭）
          *   - id: 可选，按钮ID
          *   - role: 可选，按钮角色（primary/secondary）。默认最后一个为 primary
+         * @param {Object} [options] - 额外配置
+         *   - options.onClose: 可选，弹窗被关闭（X 按钮/Esc/点击按钮后自动关闭）时触发的回调，一次性
          */
-        showModal(title, content, actions = []) {
+        showModal(title, content, actions = [], options = {}) {
           // 设置对话框内容
           this.elements.modalTitle.innerHTML = title;
           this.elements.modalContent.innerHTML = content;
           // 确保按钮区域可见（防止被先前流程隐藏）
           this.elements.modalActions.classList.remove("hidden");
           this.elements.modalActions.innerHTML = ""; // 清空旧按钮防止重复
+          this._onModalClose = typeof options.onClose === "function" ? options.onClose : null;
 
           // 动态创建按钮
           let primaryButton = null;
@@ -1288,6 +1389,12 @@
           this.elements.modalContainer.classList.add("hidden");
           this.elements.modal.classList.remove("modal-large");
           document.body.style.overflow = "auto";
+          // 触发一次性关闭回调（用于释放等待弹窗结果的 Promise，避免流程永久挂起）
+          if (typeof this._onModalClose === "function") {
+            const callback = this._onModalClose;
+            this._onModalClose = null;
+            callback();
+          }
         }
 
         /**
@@ -1390,6 +1497,20 @@
          */
         async deleteGift(giftId) {
           return this.database.delete("gifts", giftId);
+        }
+
+        /**
+         * 单事务内替换事项的全部礼金记录（用于备份导入）
+         */
+        replaceGiftsForEvent(eventId, giftRecords, clearFirst) {
+          return this.database.replaceGiftsForEvent(eventId, giftRecords, clearFirst);
+        }
+
+        /**
+         * 单事务内删除事项的全部礼金记录（用于删除事项）
+         */
+        deleteGiftsByEvent(eventId) {
+          return this.database.deleteGiftsByEvent(eventId);
         }
       }
 
@@ -1497,6 +1618,32 @@
         clear(eventId) {
           localStorage.removeItem(this._key(eventId));
         }
+
+        /**
+         * 清扫所有已过期的密码缓存条目
+         * 过期条目若不再被读取会一直残留在 localStorage（且可被还原出明文密码），应用启动时统一清理
+         */
+        sweepExpired() {
+          try {
+            const expiredKeys = [];
+            for (let i = 0; i < localStorage.length; i++) {
+              const key = localStorage.key(i);
+              if (key && key.startsWith(this.storagePrefix)) expiredKeys.push(key);
+            }
+            expiredKeys.forEach((key) => {
+              try {
+                const cached = JSON.parse(localStorage.getItem(key));
+                if (!cached || Date.now() > (cached.expireTime || 0)) {
+                  localStorage.removeItem(key);
+                }
+              } catch {
+                localStorage.removeItem(key);
+              }
+            });
+          } catch (error) {
+            console.error("密码缓存清扫失败:", error);
+          }
+        }
       }
 
       /**
@@ -1575,8 +1722,9 @@
 
           const amountChinese = Utils.amountToChinese(g.amount);
           const displayName = g.name.length === 2 ? `${g.name[0]}\u3000${g.name[1]}` : g.name;
+          const safeDisplayName = Utils.escapeHtml(displayName);
           return {
-            nameHTML: `<div class="name ${g.name.length > 4 ? "scale" : ""} ${nameClasses}">${displayName}</div>${statusIndicators}`,
+            nameHTML: `<div class="name ${g.name.length > 4 ? "scale" : ""} ${nameClasses}">${safeDisplayName}</div>${statusIndicators}`,
             amountHTML: `<div class="amount-chinese ${amountChinese.length > 16 ? "scale" : ""} ${amountClasses}">${amountChinese}</div>
                       <div class="amount-numeric ${Math.abs(g.amount).toString().length > 8 ? "scale" : ""} ${amountClasses}">￥${g.amount}</div>`,
             giftIndex,
@@ -1636,13 +1784,21 @@
          * 性能优化：重建缓存数据
          * 重新计算总金额、总人数等统计信息
          * 在加载事项或批量解密后调用
+         * 同时维护 _counted 标志，保证后台解密的增量累加不会与全量重建重复计数
          */
         rebuildCache() {
           const app = this.app;
-          app.totalAmountCache = app.gifts.reduce((sum, gift) => {
-            return gift.data && !gift.data.abolished ? sum + gift.data.amount : sum;
-          }, 0);
-          app.totalGiversCache = app.gifts.filter((g) => g.data && !g.data.abolished).length;
+          app.totalAmountCache = 0;
+          app.totalGiversCache = 0;
+          app.gifts.forEach((gift) => {
+            if (gift.data && !gift.data.abolished) {
+              app.totalAmountCache += gift.data.amount;
+              app.totalGiversCache += 1;
+              gift._counted = true;
+            } else {
+              gift._counted = false;
+            }
+          });
           app.statsAreDirty = true; // 标记统计详情需要重新计算
         }
 
@@ -1661,11 +1817,13 @@
         /**
          * 性能优化：增量更新缓存（修改记录）
          * 根据金额差额更新缓存，避免重新遍历
+         * 已作废记录不计入缓存，修改其金额时不得触碰缓存，防止污染
          * @param {number} oldAmount - 原金额
          * @param {number} newAmount - 新金额
          */
-        updateCacheOnUpdate(oldAmount, newAmount) {
+        updateCacheOnUpdate(oldAmount, newAmount, updatedData) {
           const app = this.app;
+          if (updatedData?.abolished) return; // 作废记录不在缓存口径内
           app.totalAmountCache = app.totalAmountCache - oldAmount + newAmount;
           // 人数不变
           app.statsAreDirty = true;
@@ -1674,6 +1832,7 @@
         /**
          * 统一的解密方法 - 避免代码冗余
          * 解密指定范围内的礼金记录，自动跳过已解密条目
+         * 解密失败的记录保留密文并标记 _decryptFailed，计入 app.decryptFailureCount（不静默丢弃）
          * @param {number} startIdx - 起始索引（包含）
          * @param {number} endIdx - 结束索引（不包含）
          * @returns {number} 实际解密记录数
@@ -1689,14 +1848,46 @@
           for (let i = startIdx; i < actualEnd; i++) {
             if (app.gifts[i] && app.gifts[i]._needsDecrypt) {
               const decryptedData = CryptoService.decrypt(app.gifts[i].encryptedData, app.currentPassword);
-              app.gifts[i].data = decryptedData;
+              if (decryptedData) {
+                app.gifts[i].data = decryptedData;
+                app.gifts[i].encryptedData = null; // 释放内存
+                decryptedCount++;
+              } else {
+                // 解密失败（密码不符或数据损坏）：保留密文以便重试，仅做标记
+                app.gifts[i]._decryptFailed = true;
+                app.decryptFailureCount = (app.decryptFailureCount || 0) + 1;
+              }
               app.gifts[i]._needsDecrypt = false;
-              app.gifts[i].encryptedData = null; // 释放内存
-              decryptedCount++;
             }
           }
 
           return decryptedCount;
+        }
+
+        /**
+         * 确保全部礼金记录已解密（导出/统计/查重/搜索等强一致场景的入口防线）
+         * 懒加载模式下后台解密可能尚未完成，此方法同步补齐剩余解密并修正统计缓存
+         */
+        ensureAllGiftsDecrypted() {
+          const app = this.app;
+          if (!app.gifts.length || app.allGiftsDecrypted) return;
+          const decryptedCount = this.decryptGiftsRange(0, app.gifts.length);
+          if (decryptedCount > 0) {
+            this.rebuildCache();
+            this.updateTotals();
+            app.statsAreDirty = true;
+          }
+          this.notifyDecryptFailuresIfNeeded();
+        }
+
+        /**
+         * 提示解密失败的记录数（一次性提醒，避免用户误以为数据丢失而重复录入）
+         */
+        notifyDecryptFailuresIfNeeded() {
+          const app = this.app;
+          if (!app.decryptFailureCount) return;
+          app.ui.showNotification(`有 ${app.decryptFailureCount} 条记录解密失败（密码可能不正确或数据损坏），相关记录将显示为空白。`, "error");
+          app.decryptFailureCount = 0;
         }
 
         /**
@@ -1707,6 +1898,9 @@
         async loadGiftsForCurrentEvent() {
           const app = this.app;
           app.allGiftsDecrypted = false;
+          app.decryptFailureCount = 0;
+          // 会话令牌：切换/重载事项后，旧的后台解密循环检测到令牌变化即自行退出
+          const decryptSessionId = ++app.decryptSessionId;
           const encryptedGifts = await app.giftRepository.fetchOrderedGifts(app.currentEvent.id);
 
           // 容错处理：确保所有记录都有 guestLevelWeight 和 levelUpdateTime
@@ -1717,7 +1911,7 @@
             if (g.levelUpdateTime === undefined || g.levelUpdateTime === null) {
               g.levelUpdateTime = 0; // 默认为 0（未修改过等级）
             }
-            return { ...g, data: null, _needsDecrypt: true };
+            return { ...g, data: null, _needsDecrypt: true, _decryptFailed: false };
           });
           const pageSize = app.getItemsPerPage();
           const totalPages = Math.ceil(app.gifts.length / pageSize) || 1;
@@ -1727,7 +1921,7 @@
           const endTime = new Date(app.currentEvent.endDateTime);
           const isEventEnded = now > endTime;
           app.currentPage = isEventEnded ? 1 : totalPages;
-          if (!this.allGiftsDecrypted) {
+          if (!app.allGiftsDecrypted) {
             // 解密当前页数据
             const pageStart = (app.currentPage - 1) * pageSize;
             const pageEnd = Math.min(pageStart + pageSize, app.gifts.length);
@@ -1736,49 +1930,61 @@
 
           app.giftManager.rebuildCache();
           app.giftManager.render();
+          this.notifyDecryptFailuresIfNeeded();
 
           // 异步解密剩余数据
           if (app.gifts.length > 0) {
             const scheduleIdle = typeof requestIdleCallback === "function" ? requestIdleCallback : (cb) => setTimeout(cb, 16);
-            scheduleIdle(() => app.giftManager.decryptRemainingGifts(0));
+            scheduleIdle(() => app.giftManager.decryptRemainingGifts(0, decryptSessionId));
           }
         }
 
         /**
          * 利用 requestIdleCallback 在浏览器空闲时解密
          * 避免一次性解密阻塞主线程，大量数据时分批处理
+         * @param {number} startIndex - 起始索引
+         * @param {number} [sessionId] - 会话令牌，与 app.decryptSessionId 不一致时终止（事项已切换）
          */
-        async decryptRemainingGifts(startIndex) {
+        async decryptRemainingGifts(startIndex, sessionId) {
           const app = this.app;
           const BATCH_SIZE = 300;
-          let didDecrypt = false;
 
           for (let i = startIndex; i < app.gifts.length; i += BATCH_SIZE) {
-            const batchEnd = Math.min(i + BATCH_SIZE, app.gifts.length);
+            // 事项已切换/重载，放弃本次后台解密
+            if (sessionId !== undefined && sessionId !== app.decryptSessionId) return;
 
-            // 使用统一的解密方法
-            const decryptedCount = app.giftManager.decryptGiftsRange(i, batchEnd);
-            if (decryptedCount > 0) {
-              didDecrypt = true;
-            }
+            const batchEnd = Math.min(i + BATCH_SIZE, app.gifts.length);
+            app.giftManager.decryptGiftsRange(i, batchEnd);
 
             // 等待浏览器空闲再继续
             await new Promise((resolve) => {
               if ("requestIdleCallback" in window) {
                 requestIdleCallback(resolve);
               } else {
-                setTimeout(resolve, 16); //
+                setTimeout(resolve, 16);
               }
             });
 
-            // 更新缓存和 UI
-            if (didDecrypt) {
-              app.giftManager.rebuildCache();
+            // 增量修正统计缓存（初始缓存只统计了已解密部分，此处只加新解密的）
+            const batch = app.gifts.slice(i, batchEnd);
+            let changed = false;
+            batch.forEach((g) => {
+              if (g.data && !g.data.abolished && !g._counted) {
+                app.totalAmountCache += g.data.amount;
+                app.totalGiversCache += 1;
+                g._counted = true;
+                changed = true;
+              }
+            });
+            if (changed) {
+              app.statsAreDirty = true;
               app.giftManager.updateTotals();
-              didDecrypt = false; // 重置标志
             }
           }
-          app.allGiftsDecrypted = true; // 标记所有数据已解密
+          if (sessionId === undefined || sessionId === app.decryptSessionId) {
+            app.allGiftsDecrypted = true; // 标记所有数据已解密
+            this.notifyDecryptFailuresIfNeeded();
+          }
         }
 
         /**
@@ -1869,7 +2075,7 @@
           const end = Math.min(start + app.getItemsPerPage(), app.gifts.length);
 
           // 使用统一的解密方法
-          !this.allGiftsDecrypted && app.giftManager.decryptGiftsRange(start, end);
+          !app.allGiftsDecrypted && app.giftManager.decryptGiftsRange(start, end);
         }
 
         /**
@@ -1990,7 +2196,7 @@
             app.giftManager.updateSingleGiftDOM(giftIndex, updatedData);
 
             if (oldAmount !== newAmount) {
-              app.giftManager.updateCacheOnUpdate(oldAmount, newAmount);
+              app.giftManager.updateCacheOnUpdate(oldAmount, newAmount, updatedData);
               app.giftManager.updateTotals();
             }
             app.ui.closeModal();
@@ -2010,7 +2216,6 @@
         async abolishGift(giftIndex) {
           const app = this.app;
           const gift = app.gifts[giftIndex];
-          app.guestScreenService.syncToGuestScreen();
           if (!gift || !gift.data) return;
           if (gift.data.abolished) {
             app.ui.showNotification("该记录已被作废。");
@@ -2029,23 +2234,34 @@
                             required></textarea>
                           <p class="text-xs text-gray-500">注：作废后，该记录将保留在系统中但不计入总金额，并且不会在打印PDF时显示。</p>
                         </div>
-                      `;
-            app.ui.showModal("请输入作废理由", content, [
-              { text: "取消", class: "themed-button-secondary border px-4 py-2 rounded", handler: () => resolve(null) },
-              {
-                text: "下一步",
-                class: "themed-button-primary text-white px-4 py-2 rounded  ",
-                handler: () => {
-                  const reasonText = document.getElementById("abolish-reason-input").value.trim();
-                  if (!reasonText) {
-                    app.ui.showNotification("请填写作废理由。", "error");
-                    return; // 保持弹窗打开
-                  }
-                  resolve(reasonText);
+                        `;
+            let settled = false;
+            const settle = (value) => {
+              if (settled) return;
+              settled = true;
+              resolve(value);
+            };
+            app.ui.showModal(
+              "请输入作废理由",
+              content,
+              [
+                { text: "取消", class: "themed-button-secondary border px-4 py-2 rounded", handler: () => settle(null) },
+                {
+                  text: "下一步",
+                  class: "themed-button-primary text-white px-4 py-2 rounded  ",
+                  handler: () => {
+                    const reasonText = document.getElementById("abolish-reason-input").value.trim();
+                    if (!reasonText) {
+                      app.ui.showNotification("请填写作废理由。", "error");
+                      return; // 保持弹窗打开
+                    }
+                    settle(reasonText);
+                  },
+                  keepOpen: true,
                 },
-                keepOpen: true,
-              },
-            ]);
+              ],
+              { onClose: () => settle(null) }
+            );
             setTimeout(() => document.getElementById("abolish-reason-input")?.focus(), 50);
           });
 
@@ -2067,7 +2283,7 @@
 
             const historyEntry = {
               timestamp: now,
-              changeLog: `该记录已作废。，理由：${reason}`,
+              changeLog: `该记录已作废，理由：${reason}`,
               snapshot: app.giftManager.createSnapshot(currentData),
               type: "abolish",
             };
@@ -2181,10 +2397,19 @@
 
                 const selectedEngine = app.currentEvent.printOptions?.pdfEngine || "browser";
                 const usePdfLib = Utils.isMobile() || selectedEngine === "pdf-lib";
+                let success = false;
                 if (usePdfLib) {
-                  await app.exportService.generatePdf(start, end, partIndex);
+                  success = await app.exportService.generatePdf(start, end, partIndex);
                 } else {
                   await app.exportService.executePrint(start, end, partIndex, totalChunks);
+                  success = true;
+                }
+
+                if (!success) {
+                  // 生成失败（含并发守卫拦截）：恢复按钮状态，不标记完成
+                  mainTextSpan.textContent = originalText;
+                  el.classList.remove("cursor-wait");
+                  return;
                 }
 
                 el.dataset.status = "completed";
@@ -2203,12 +2428,13 @@
          * @param {number} startIndex - 起始索引
          * @param {number} endIndex - 结束索引
          * @param {number|null} partIndex - 分批编号（为 null 时表示不分批）
+         * @returns {Promise<boolean>} 是否成功生成
          */
         async generatePdf(startIndex, endIndex, partIndex = null) {
           const app = this.app;
           if (app.isGeneratingPdf) {
             app.ui.showNotification("正在生成 PDF，请勿重复操作...", "info");
-            return;
+            return false;
           }
 
           const printBtn = app.ui.elements.printBtn;
@@ -2220,6 +2446,9 @@
             printBtn.disabled = true;
             printBtn.innerHTML = '<i class="ri-loader-4-line animate-spin mr-2"></i>正在生成...';
             app.ui.showNotification("正在生成 PDF 文件，请稍候...", "info");
+
+            // 懒解密兜底：确保待导出范围（及总计金额）基于完整解密数据
+            app.giftManager.ensureAllGiftsDecrypted();
 
             // ====================== 1. 解析自定义配置（统一处理“自定义 or 兜底”） ======================
             const customStyle = app.currentEvent.customStyle || {};
@@ -2333,14 +2562,17 @@
             // ====================== 4. 生成 PDF ======================
             app.pdfGenerator = new GiftRegistryPDF(generatorOptions);
 
-            const data = app.gifts.slice(startIndex, endIndex).map(({ data }) => ({
-              name: data.name,
-              amount: data.amount,
-              type: data.type,
-              remark: app.formatRemarkDisplay(data.remarkData) || null,
-              abolished: !!data.abolished,
-              amountText: Utils.amountToChinese(data.amount),
-            }));
+            const data = app.gifts
+              .slice(startIndex, endIndex)
+              .filter(({ data }) => data) // 防御解密失败的记录
+              .map(({ data }) => ({
+                name: data.name,
+                amount: data.amount,
+                type: data.type,
+                remark: app.formatRemarkDisplay(data.remarkData) || null,
+                abolished: !!data.abolished,
+                amountText: Utils.amountToChinese(data.amount),
+              }));
 
             const pdfBytes = await app.pdfGenerator.generate(data, generatorOptions);
             const blob = new Blob([pdfBytes], { type: "application/pdf" });
@@ -2354,9 +2586,12 @@
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
+            setTimeout(() => URL.revokeObjectURL(pdfUrl), 60000);
+            return true;
           } catch (error) {
             console.error(error);
             app.ui.showNotification("生成 PDF 时出现错误，请重试。", "error");
+            return false;
           } finally {
             app.isGeneratingPdf = false;
             printBtn.disabled = false;
@@ -2370,8 +2605,8 @@
          */
         executePrint(startIdx, endIdx, partIndex = null, totalParts = null) {
           const app = this.app;
-          // 确保数据已解密
-          !this.allGiftsDecrypted && app.giftManager.decryptGiftsRange(startIdx, endIdx);
+          // 确保数据已解密（打印内容页与附录均需完整数据）
+          app.giftManager.ensureAllGiftsDecrypted();
           const allGiftsSubset = app.gifts.slice(startIdx, endIdx);
 
           return new Promise(async (resolve) => {
@@ -2388,7 +2623,7 @@
             };
             const eventDateInfo = Utils.getEventDateInfo(app.currentEvent.startDateTime);
 
-            document.title = `${app.currentEvent.name}礼金记录{partIndex ? "-P" + partIndex : ""}-${eventDateInfo.localeDate}`;
+            document.title = `${app.currentEvent.name}礼金记录${partIndex ? "-P" + partIndex : ""}-${eventDateInfo.localeDate}`;
 
             // 封面页
             if (printOptions.printCover) {
@@ -2508,7 +2743,7 @@
             document.body.removeChild(link);
             URL.revokeObjectURL(url);
 
-            app.ui.showNotification("JSON 备份已导出。", "success");
+            app.ui.showNotification("JSON 备份已导出（明文含姓名/电话等敏感信息，请妥善保管）。", "success");
           } catch (error) {
             console.error("导出 JSON 备份失败:", error);
             app.ui.showNotification("导出 JSON 文件失败，请重试。", "error");
@@ -2533,18 +2768,16 @@
             const FILE_VERSION = 0x01;
             const HEADER_LENGTH = 8;
 
-            // 获取并处理礼金数据
+            // 获取礼金数据：直接复用数据库中已有的密文（同一密码下重新加解密是纯开销）
             const eventId = app.currentEvent.id;
             const rawGifts = await app.giftRepository.fetchGiftsByEvent(eventId);
 
             const sanitizedGifts = rawGifts.map((gift) => {
-              const decrypted = CryptoService.decrypt(gift.encryptedData, app.currentPassword);
-              if (!decrypted) {
-                throw new Error("decrypt_failed");
+              if (!gift.encryptedData) {
+                throw new Error("missing_ciphertext");
               }
-              const encryptedData = CryptoService.encrypt(decrypted, app.currentPassword);
               return {
-                encryptedData,
+                encryptedData: gift.encryptedData,
                 guestLevelWeight: gift.guestLevelWeight ?? 0,
                 levelUpdateTime: gift.levelUpdateTime ?? 0,
               };
@@ -2679,21 +2912,38 @@
                                class="w-full p-2 border rounded themed-ring"
                                placeholder="请输入备份文件的解密密码">
                       `;
-                app.ui.showModal("输入解密密码", content, [
-                  {
-                    text: "取消",
-                    class: "themed-button-secondary border px-4 py-2 rounded",
-                    handler: () => resolve(null),
-                  },
-                  {
-                    text: "确认",
-                    class: "themed-button-primary px-4 py-2 rounded",
-                    handler: () => {
-                      const pwd = document.getElementById("backup-pwd-input").value;
-                      resolve(pwd);
+                let settled = false;
+                const settle = (value) => {
+                  if (settled) return;
+                  settled = true;
+                  resolve(value);
+                };
+                app.ui.showModal(
+                  "输入解密密码",
+                  content,
+                  [
+                    {
+                      text: "取消",
+                      class: "themed-button-secondary border px-4 py-2 rounded",
+                      handler: () => settle(null),
                     },
-                  },
-                ]);
+                    {
+                      text: "确认",
+                      class: "themed-button-primary px-4 py-2 rounded",
+                      keepOpen: true,
+                      handler: () => {
+                        const pwd = document.getElementById("backup-pwd-input").value;
+                        if (!pwd) {
+                          app.ui.showNotification("请输入备份文件的解密密码。", "error");
+                          return;
+                        }
+                        settle(pwd);
+                        app.ui.closeModal();
+                      },
+                    },
+                  ],
+                  { onClose: () => settle(null) }
+                );
                 setTimeout(() => document.getElementById("backup-pwd-input")?.focus(), 50);
               });
 
@@ -2715,29 +2965,41 @@
             const payload = JSON.parse(decrypted);
             const giftRecords = Array.isArray(payload?.gifts) ? payload.gifts : [];
 
-            // 步骤5：根据缓存的勾选状态决定是否清空旧数据
-            if (shouldClearOldData) {
-              const existingGifts = await app.giftRepository.fetchGiftsByEvent(app.currentEvent.id);
-              for (const gift of existingGifts) {
-                await app.giftRepository.deleteGift(gift.id);
-              }
-              app.ui.showNotification("旧数据已清空。", "info");
-            }
-
-            // 步骤6：导入礼金数据
+            // 步骤5+6：准备写入记录
+            // 关键：备份内每条密文是用"备份导出时的密码"（即 finalPassword）加密的。
+            // 若 finalPassword 与当前事项密码不同，必须先解密再以当前事项密码重新加密，
+            // 否则导入后的记录将永远无法用当前密码解开（表现为空白格、统计为 0）
+            const needsReEncrypt = finalPassword !== currentEventPassword;
+            const recordsToImport = [];
+            let skippedCount = 0;
             for (const record of giftRecords) {
-              let encryptedData = record.encryptedData;
-              if (!encryptedData && record.data) {
-                encryptedData = CryptoService.encrypt(record.data, finalPassword);
+              let encryptedData = null;
+              if (record.encryptedData) {
+                if (needsReEncrypt) {
+                  const plain = CryptoService.decrypt(record.encryptedData, finalPassword);
+                  encryptedData = plain ? CryptoService.encrypt(plain, currentEventPassword) : null;
+                } else {
+                  encryptedData = record.encryptedData;
+                }
+              } else if (record.data) {
+                // 兼容携带明文的备份格式
+                encryptedData = CryptoService.encrypt(record.data, currentEventPassword);
               }
-              if (!encryptedData) continue;
-
-              await app.giftRepository.createGift({
-                eventId: app.currentEvent.id,
+              if (!encryptedData) {
+                skippedCount++;
+                continue;
+              }
+              recordsToImport.push({
                 encryptedData,
                 guestLevelWeight: record.guestLevelWeight ?? 0,
                 levelUpdateTime: record.levelUpdateTime ?? 0,
               });
+            }
+
+            // 单事务原子写入：勾选"清空旧数据"时，删除与导入要么全部成功、要么全部回滚
+            const importedCount = await app.dbManager.replaceGiftsForEvent(app.currentEvent.id, recordsToImport, shouldClearOldData);
+            if (shouldClearOldData) {
+              app.ui.showNotification("旧数据已清空。", "info");
             }
 
             // 步骤7：更新事项信息
@@ -2762,7 +3024,11 @@
             app.session.save(app.currentEvent, app.currentPassword);
 
             app.ui.closeModal();
-            app.ui.showNotification(`数据恢复成功，${shouldClearOldData ? "替换" : "追加"}了 ${giftRecords.length} 条记录。`, "success");
+            let importMessage = `数据恢复成功，${shouldClearOldData ? "替换" : "追加"}了 ${importedCount} 条记录。`;
+            if (skippedCount > 0) {
+              importMessage += `另有 ${skippedCount} 条记录无法解密被跳过。`;
+            }
+            app.ui.showNotification(importMessage, "success");
           } catch (error) {
             console.error("导入备份失败:", error);
             app.ui.showNotification("导入失败，文件格式可能无效或已损坏。", "error");
@@ -2874,7 +3140,7 @@
                           <p class="text-sm text-gray-600">首次打印前建议补充关键信息，后续可在“设置事项”中继续修改。</p>
                           <div>
                             <label class="block text-sm font-medium text-gray-700 mb-1">记账人 <span class="text-xs text-red-400">(建议填写，非必填)</span></label>
-                            <input id="print-first-recorder" type="text" class="w-full p-2 border rounded themed-ring" maxlength="30" value="${currentRecorder}" placeholder="示例：王五">
+                            <input id="print-first-recorder" type="text" class="w-full p-2 border rounded themed-ring" maxlength="30" value="${Utils.escapeHtml(currentRecorder)}" placeholder="示例：王五">
                           </div>
                           <div>
                             <span class="block text-sm font-medium text-gray-700 mb-1">PDF渲染方式</span>
@@ -2980,13 +3246,14 @@
           for (let i = 0; i < app.getItemsPerPage(); i++) {
             const gift = gifts[i];
             const giftIndex = isPrint ? null : (app.currentPage - 1) * app.getItemsPerPage() + i;
+            // 一次生成复用两格，避免姓名/金额重复执行大写转换等计算
+            const cellHTML = gift?.data ? app.giftManager.generateGiftCellHTML(gift, giftIndex) : null;
 
             // 姓名单元格
             const nameCell = document.createElement("div");
             nameCell.className = "book-cell name-cell";
-            if (gift?.data) {
-              const { nameHTML } = app.giftManager.generateGiftCellHTML(gift, giftIndex);
-              nameCell.innerHTML = nameHTML;
+            if (cellHTML) {
+              nameCell.innerHTML = cellHTML.nameHTML;
               if (!isPrint) nameCell.dataset.giftIndex = giftIndex;
             }
             nameRow.appendChild(nameCell);
@@ -3000,9 +3267,8 @@
             // 金额单元格
             const amountCell = document.createElement("div");
             amountCell.className = "book-cell amount-cell";
-            if (gift?.data) {
-              const { amountHTML } = app.giftManager.generateGiftCellHTML(gift, giftIndex);
-              amountCell.innerHTML = amountHTML;
+            if (cellHTML) {
+              amountCell.innerHTML = cellHTML.amountHTML;
               if (!isPrint) amountCell.dataset.giftIndex = giftIndex;
             }
             amountRow.appendChild(amountCell);
@@ -3098,7 +3364,8 @@
             let currentPageItems = [];
             let remainingPageHeight = MAX_PAGE_CONTENT_HEIGHT_PX - TABLE_HEADER_HEIGHT_PX - 100;
             for (const gift of giftsWithRemarks) {
-              let remainingRemarkText = app.formatRemarkDisplay(gift.data.remarkData || {}, " / ");
+              // 转义后同时用于高度测量与最终渲染，防止备注中的 HTML 被解释执行
+              let remainingRemarkText = Utils.escapeHtml(app.formatRemarkDisplay(gift.data.remarkData || {}, " / "));
               let isFirstChunk = true;
               while (remainingRemarkText.length > 0) {
                 if (remainingPageHeight <= 50 && currentPageItems.length > 0) {
@@ -3132,7 +3399,7 @@
               appendixPage.className = "print-page";
               const tableRows = pageItems
                 .map((item) => {
-                  const nameCellContent = item.gift.data.name;
+                  const nameCellContent = Utils.escapeHtml(item.gift.data.name);
                   const indexCellContent = item.isContinuation ? " (续上)" : item.gift.indexLabel;
                   return `<tr><td>${nameCellContent}</td><td>${indexCellContent}</td><td class="text-left">${item.remarkText || "无"}</td></tr>`;
                 })
@@ -3252,6 +3519,10 @@
             return;
           }
 
+          // 懒解密兜底：大数据量刚进入事项即导出时，后台解密可能未完成
+          app.giftManager.ensureAllGiftsDecrypted();
+
+          try {
           const formatHistoryToString = (historyArray) => {
             if (!historyArray || historyArray.length === 0) return "无修改记录";
             return [...historyArray]
@@ -3273,6 +3544,7 @@
           // 直接遍历已排序的 app.gifts 数组
           for (let i = 0; i < app.gifts.length; i++) {
             const g = app.gifts[i];
+            if (!g.data) continue; // 防御解密失败的记录
             const isAbolished = g.data.abolished === true;
             const guestLevel = g.data.guestLevel !== undefined ? g.data.guestLevel : 0;
             const guestLevelName = CONFIG.GUEST_LEVELS[guestLevel] || CONFIG.GUEST_LEVELS[0];
@@ -3367,8 +3639,14 @@
             XLSX.utils.book_append_sheet(workbook, giftWorksheet, "礼品清单");
           }
           const eventDateInfo = Utils.getEventDateInfo(app.currentEvent.startDateTime);
-          XLSX.writeFile(workbook, `${app.currentEvent.name}-礼金明细(${eventDateInfo.localeDate}).xlsx`);
+          const safeEventName = (app.currentEvent.name || "礼簿").replace(/[\\/:*?"<>|]/g, "_");
+          const dateStr = eventDateInfo.localeDate.replace(/\//g, "-");
+          XLSX.writeFile(workbook, `${safeEventName}-礼金明细(${dateStr}).xlsx`);
           app.ui.showNotification("导出成功！", "success");
+          } catch (error) {
+            console.error("导出 Excel 失败:", error);
+            app.ui.showNotification("导出 Excel 失败，请重试。", "error");
+          }
         }
       }
       class StatsService {
@@ -3385,6 +3663,9 @@
         showStatistics() {
           const app = this.app;
           app.ui.elements.modal.classList.add("modal-large");
+
+          // 懒解密兜底：统计与明细表必须基于完整解密数据，否则金额/条数偏少且表格渲染会因 data 为 null 报错
+          app.giftManager.ensureAllGiftsDecrypted();
 
           if (app.statsAreDirty || !app.cachedStats) {
             const activeGifts = app.gifts.filter((g) => g.data && !g.data.abolished);
@@ -3482,22 +3763,24 @@
           app.ui.showModal("礼金统计详情", statsHtml, [{ text: "关闭", class: "themed-button-secondary border px-4 py-2 rounded" }]);
 
           setTimeout(() => {
-            let currentFilteredGifts = [...app.gifts];
+            let currentFilteredGifts = app.gifts.filter((g) => g.data);
             let currentGrid = null;
             const renderGrid = (giftsToShow) => {
-              const tableData = giftsToShow.map((g) => {
-                const guestLevel = g.data.guestLevel !== undefined ? g.data.guestLevel : 0;
-                const guestLevelName = CONFIG.GUEST_LEVELS[guestLevel] || CONFIG.GUEST_LEVELS[0];
-                const remarkTextForTable = app.formatRemarkDisplay(g.data.remarkData || {}, " / ") || "无";
-                return [
-                  g.data.name,
-                  g.data.amount,
-                  remarkTextForTable, // 使用格式化方法
-                  g.data.type,
-                  new Date(g.data.timestamp).toLocaleString("zh-CN"),
-                  g.data.abolished ? "已作废" : "正常",
-                ];
-              });
+              const tableData = giftsToShow
+                .filter((g) => g.data) // 防御解密失败的记录
+                .map((g) => {
+                  const guestLevel = g.data.guestLevel !== undefined ? g.data.guestLevel : 0;
+                  const guestLevelName = CONFIG.GUEST_LEVELS[guestLevel] || CONFIG.GUEST_LEVELS[0];
+                  const remarkTextForTable = app.formatRemarkDisplay(g.data.remarkData || {}, " / ") || "无";
+                  return [
+                    g.data.name,
+                    g.data.amount,
+                    remarkTextForTable, // 使用格式化方法
+                    g.data.type,
+                    new Date(g.data.timestamp).toLocaleString("zh-CN"),
+                    g.data.abolished ? "已作废" : "正常",
+                  ];
+                });
 
               const shouldPaginate = giftsToShow.length > CONFIG.PRINT_SPLIT_THRESHOLD;
               const gridConfig = {
@@ -3540,9 +3823,10 @@
               currentGrid.on("rowClick", (...args) => {
                 const row = args.length > 1 ? args[1] : args[0];
                 const clickedName = row.cells[0].data;
-                const clickedTime = row.cells[5].data;
+                // 列顺序：0 姓名 / 1 金额 / 2 备注 / 3 收款类型 / 4 录入时间 / 5 状态
+                const clickedTime = row.cells[4].data;
 
-                const clickedGift = giftsToShow.find((g) => g.data.name === clickedName && new Date(g.data.timestamp).toLocaleString("zh-CN") === clickedTime);
+                const clickedGift = giftsToShow.find((g) => g.data && g.data.name === clickedName && new Date(g.data.timestamp).toLocaleString("zh-CN") === clickedTime);
 
                 if (clickedGift) {
                   const giftIndex = app.gifts.findIndex((g) => g.id === clickedGift.id);
@@ -3561,25 +3845,26 @@
 
               switch (filterType) {
                 case "all":
-                  currentFilteredGifts = [...app.gifts];
+                  currentFilteredGifts = app.gifts.filter((g) => g.data);
                   break;
                 case "max-amount":
-                  currentFilteredGifts = [...app.gifts].sort((a, b) => b.data.amount - a.data.amount);
+                  currentFilteredGifts = app.gifts.filter((g) => g.data).sort((a, b) => b.data.amount - a.data.amount);
                   break;
                 case "min-amount":
-                  currentFilteredGifts = [...app.gifts].sort((a, b) => a.data.amount - b.data.amount);
+                  currentFilteredGifts = app.gifts.filter((g) => g.data).sort((a, b) => a.data.amount - b.data.amount);
                   break;
                 case "has-remarks":
-                  currentFilteredGifts = app.gifts.filter((g) => app.hasRemarkData(g.data));
+                  currentFilteredGifts = app.gifts.filter((g) => g.data && app.hasRemarkData(g.data));
                   break;
                 case "has-gifts":
                   currentFilteredGifts = app.gifts.filter((g) => {
+                    if (!g.data) return false;
                     const remark = app.normalizeRemarkData(g.data.remarkData);
                     return remark.gift && remark.gift.trim() !== "";
                   });
                   break;
                 case "abolished":
-                  currentFilteredGifts = app.gifts.filter((g) => g.data.abolished === true);
+                  currentFilteredGifts = app.gifts.filter((g) => g.data && g.data.abolished === true);
                   break;
                 case "cash":
                   currentFilteredGifts = app.gifts.filter((g) => g.data && g.data.type === "现金");
@@ -3594,7 +3879,7 @@
                   currentFilteredGifts = app.gifts.filter((g) => g.data && g.data.type === "其他");
                   break;
                 default:
-                  currentFilteredGifts = [...app.gifts];
+                  currentFilteredGifts = app.gifts.filter((g) => g.data);
               }
 
               renderGrid(currentFilteredGifts);
@@ -3661,13 +3946,18 @@
             HEARTBEAT: "guest_screen_heartbeat",
             CONFIG: "guest_screen_config",
           };
+          // file:// 协议下 origin 为 "null"，postMessage 不接受该值，只能退回 "*"
+          this.targetOrigin = location.origin && location.origin !== "null" ? location.origin : "*";
 
           window.addEventListener("message", (e) => this.handleMessage(e));
         }
 
         /**
+         * 仅接受来自副屏窗口、同源（file:// 除外）的消息，防止任意页面伪造 guest_screen_ready
          */
         handleMessage(event) {
+          if (this.targetOrigin !== "*" && event.origin !== this.targetOrigin) return;
+          if (this.guestWindow && event.source !== this.guestWindow) return;
           if (event.data?.type === "guest_screen_ready") {
             this.isConnected = true;
             this.syncToGuestScreen();
@@ -3688,13 +3978,17 @@
 
           this.guestWindow = window.open("./guest-screen.html", "GuestScreen", `width=${screenWidth},height=${screenHeight},left=0,top=0,location=no,menubar=no,toolbar=no`);
 
-          if (this.guestWindow) {
-            setTimeout(() => {
-              if (this.guestWindow?.document.documentElement.requestFullscreen) {
-                this.guestWindow.document.documentElement.requestFullscreen().catch(() => console.log("无法自动全屏"));
-              }
-            }, 500);
+          if (!this.guestWindow) {
+            // 弹窗被浏览器拦截时明确告知用户，而不是静默失败
+            this.app.ui.showNotification("副屏窗口被浏览器拦截，请允许弹出窗口后重试。", "error");
+            return;
           }
+
+          setTimeout(() => {
+            if (this.guestWindow?.document.documentElement.requestFullscreen) {
+              this.guestWindow.document.documentElement.requestFullscreen().catch(() => console.log("无法自动全屏"));
+            }
+          }, 500);
         }
 
         /**
@@ -3706,7 +4000,10 @@
             return;
           }
 
-          const currentPageGifts = this.app.gifts.slice((this.app.currentPage - 1) * app.getItemsPerPage(), this.app.currentPage * app.getItemsPerPage());
+          // 确保当前页数据已解密，避免副屏因 data 为 null 而丢失当前页记录
+          this.app.giftManager.ensureCurrentPageDecrypted();
+
+          const currentPageGifts = this.app.gifts.slice((this.app.currentPage - 1) * this.app.getItemsPerPage(), this.app.currentPage * this.app.getItemsPerPage());
 
           const activeGifts = currentPageGifts.filter((g) => g.data && !g.data.abolished);
 
@@ -3716,6 +4013,7 @@
               eventName: this.app.currentEvent.name,
               theme: this.app.currentEvent.theme,
               currentPage: this.app.currentPage,
+              itemsPerPage: this.app.getItemsPerPage(),
               gifts: activeGifts.map((g) => ({
                 id: g.id,
                 name: g.data.name,
@@ -3730,7 +4028,7 @@
           };
 
           try {
-            this.guestWindow.postMessage(message, "*");
+            this.guestWindow.postMessage(message, this.targetOrigin);
           } catch (error) {
             console.error("发送消息到副屏失败:", error);
             this.isConnected = false;
@@ -3754,7 +4052,7 @@
                   type: this.MESSAGE_TYPES.HEARTBEAT,
                   timestamp: Date.now(),
                 },
-                "*"
+                this.targetOrigin
               );
             } catch (error) {
               this.isConnected = false;
@@ -3815,6 +4113,9 @@
           this.pdfGenerator = null;
           this.isGeneratingPdf = false;
           this.allGiftsDecrypted = false;
+          this.decryptFailureCount = 0;
+          this.decryptSessionId = 0;
+          this.isSavingGift = false;
           this.REMARK_LABELS = [
             { key: "custom", label: "备注" },
             { key: "gift", label: "礼品" },
@@ -3831,6 +4132,7 @@
         async init() {
           try {
             await this.dbManager.init();
+            this.passwordCache.sweepExpired();
             this.setupInitialUI();
             this.bindEvents();
             await this.tryRestoreSession();
@@ -3872,6 +4174,11 @@
               this.currentEvent = event;
               this.currentPassword = decryptedPassword;
               await this.startSession();
+            } else {
+              // 会话数据无法还原（如事项密码已变更）：清除并回到初始界面，避免页面永久空白
+              this.session.clear();
+              await this.loadEvents();
+              this.ui.showScreen("setup");
             }
           } catch (error) {
             console.error("会话恢复失败", error);
@@ -4099,6 +4406,7 @@
           this.ui.elements.pageInfoEl.addEventListener("keydown", (e) => {
             if (e.target && e.target.id === "current-page-input" && e.key === "Enter") {
               e.preventDefault();
+              e.stopPropagation(); // 防止冒泡到 document 层再次触发表单提交
               this.handlePageInputChange(e);
               e.target.blur();
             }
@@ -4147,11 +4455,19 @@
             if (isModalVisible) {
               if (e.key === "Escape") {
                 e.preventDefault();
-                // 优先触发 secondary（通常为取消）
-                this.ui.elements.modalActions.querySelector('button[data-role="secondary"]')?.click();
+                // Esc 语义固定为"仅关闭弹窗"：不触发任何按钮，
+                // 避免误触破坏性操作（如礼金详情里的"作废此记录"恰是 secondary）
+                this.ui.closeModal();
                 return;
               }
-              if (e.key === "Enter" && activeElement.tagName !== "TEXTAREA" && !activeElement.classList.contains("gridjs-input")) {
+              if (e.key === "Enter" && !e.isComposing) {
+                const tag = activeElement?.tagName;
+                const isTextInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || activeElement?.isContentEditable;
+                const isPasswordInput = tag === "INPUT" && activeElement.type === "password";
+                if (isTextInput && !isPasswordInput) {
+                  // 焦点在普通输入框（如备注、事项名称）时回车不代点确认按钮，避免误提交
+                  return;
+                }
                 e.preventDefault();
                 // 始终触发 primary（确认）按钮，避免误触取消
                 const primaryBtn = this.ui.elements.modalActions.querySelector('button[data-role="primary"]') || this.ui.elements.modalActions.querySelector("button:last-child");
@@ -4181,7 +4497,11 @@
               }
             }
 
-            if (e.key === "Enter" && isMainScreenVisible && activeElement.tagName !== "TEXTAREA") {
+            if (e.key === "Enter" && !e.isComposing && isMainScreenVisible && activeElement.tagName !== "TEXTAREA") {
+              // 焦点在其它输入框（搜索框/页码框等，有自己的回车行为）时不代点提交
+              const inOtherInput = activeElement.tagName === "INPUT" && activeElement !== this.ui.elements.guestNameInput && activeElement !== this.ui.elements.giftAmountInput;
+              if (inOtherInput) return;
+
               const guestName = this.ui.elements.guestNameInput.value.trim();
               const giftAmount = this.ui.elements.giftAmountInput.value.trim();
 
@@ -4198,12 +4518,13 @@
         handlePageInputChange(e) {
           const input = e.target;
           const newPage = parseInt(input.value, 10);
-          const totalPages = Math.ceil(this.gifts.length / app.getItemsPerPage()) || 1;
+          const totalPages = Math.ceil(this.gifts.length / this.getItemsPerPage()) || 1;
 
           if (!isNaN(newPage) && newPage >= 1 && newPage <= totalPages && newPage !== this.currentPage) {
             this.currentPage = newPage;
             this.giftManager.ensureCurrentPageDecrypted();
             this.giftManager.render();
+            this.guestScreenService.syncToGuestScreen(); // 与 changePage 行为保持一致
           } else {
             input.value = this.currentPage;
           }
@@ -4307,10 +4628,9 @@
                   passwordHash: CryptoService.hash(password),
                   theme,
                   voiceName,
-                  coverType: coverType,
-                  recorder: recorder,
-                  minSpeechAmount: 0,
                   coverType,
+                  recorder,
+                  minSpeechAmount: 0,
                   printOptions: {
                     ...DEFAULT_PRINT_OPTIONS,
                     pdfEngine,
@@ -4363,6 +4683,8 @@
             this.ui.showNotification("当收款类型为“其他”时，请在备注中说明具体情况。", "error");
             return; // 阻止提交
           }
+          // 查重前确保全部记录已解密：懒解密未完成时未解密记录会被漏检，导致重复告警失效
+          this.giftManager.ensureAllGiftsDecrypted();
           // 检查重复记录：同名或同名同金额
           const sameNameGifts = this.gifts.filter((g) => g.data?.name === name);
           const exactMatchExists = sameNameGifts.some((g) => g.data?.amount === amount);
@@ -4388,6 +4710,7 @@
                           </div>
                       `;
 
+          const safeName = Utils.escapeHtml(name);
           if (exactMatchExists) {
             modalTitle = "重复信息确认";
             modalContent = `
@@ -4396,7 +4719,7 @@
                               <strong class="font-bold">警告：</strong>
                               <p class="text-sm">系统中已存在“相同姓名”且“相同金额”的记录，为避免重复录入，请仔细核对。</p>
                             </div>
-                            <p><strong>来宾姓名:</strong> <span class="text-lg">${name}</span></p>
+                            <p><strong>来宾姓名:</strong> <span class="text-lg">${safeName}</span></p>
                             <p><strong>金额:</strong> <span class="font-bold text-xl themed-text">${Utils.formatCurrency(amount)}</span></p>
                             ${remarkInputsHTML}
                           </div>`;
@@ -4405,9 +4728,9 @@
             modalContent = `
                           <div class="space-y-3 text-left">
                             <div class="p-2 bg-yellow-100 text-yellow-800 rounded-md text-sm">
-                              <strong>注意：</strong>系统中已存在名为 <strong>${name}</strong> 的记录。为避免混淆，建议您添加备注。
+                              <strong>注意：</strong>系统中已存在名为 <strong>${safeName}</strong> 的记录。为避免混淆，建议您添加备注。
                             </div>
-                            <p><strong>来宾姓名:</strong> <span class="text-lg">${name}</span></p>
+                            <p><strong>来宾姓名:</strong> <span class="text-lg">${safeName}</span></p>
                             <p><strong>金额:</strong> <span class="font-bold text-xl themed-text">${Utils.formatCurrency(amount)}</span></p>
                             ${remarkInputsHTML}
                           </div>`;
@@ -4415,10 +4738,10 @@
             modalTitle = "请确认录入信息";
             modalContent = `
                           <div class="space-y-3 text-left">
-                            <p><strong>来宾姓名:</strong> <span class="text-lg">${name}</span></p>
+                            <p><strong>来宾姓名:</strong> <span class="text-lg">${safeName}</span></p>
                             <p><strong>数字金额:</strong> <span class="font-bold text-xl themed-text">${Utils.formatCurrency(amount)}</span></p>
                             <p><strong>大写金额:</strong> <span class="font-bold text-xl themed-text">${Utils.amountToChinese(amount)}</span></p>
-                            ${remarkDisplay ? `<p><strong>备注:</strong> ${remarkDisplay}</p>` : ""}
+                            ${remarkDisplay ? `<p><strong>备注:</strong> ${Utils.escapeHtml(remarkDisplay)}</p>` : ""}
                           </div>`;
           }
 
@@ -4452,17 +4775,20 @@
          * @param {Object} giftData - 礼金数据
          */
         async saveGift(giftData) {
-          const isOutOfTime = new Date() < new Date(this.currentEvent.startDateTime) || new Date() > new Date(this.currentEvent.endDateTime);
-
-          if (isOutOfTime) {
-            const password = await this.requestAdminPassword("礼金补录", "当前已超出有效录入时间,请输入管理密码进行补录。", null, false);
-            if (password === null) {
-              this.ui.closeModal();
-              return;
-            }
-          }
-
+          // 防重入：确认弹窗 keepOpen 期间按住回车会连续触发本方法，造成同一条礼金重复入库
+          if (this.isSavingGift) return;
+          this.isSavingGift = true;
           try {
+            const isOutOfTime = new Date() < new Date(this.currentEvent.startDateTime) || new Date() > new Date(this.currentEvent.endDateTime);
+
+            if (isOutOfTime) {
+              const password = await this.requestAdminPassword("礼金补录", "当前已超出有效录入时间,请输入管理密码进行补录。", null, false);
+              if (password === null) {
+                this.ui.closeModal();
+                return;
+              }
+            }
+
             // 默认等级为 0（雅宾）
             const guestLevel = giftData.guestLevel !== undefined ? giftData.guestLevel : 0;
 
@@ -4491,6 +4817,7 @@
               levelUpdateTime: 0,
               data: fullGiftData,
               _needsDecrypt: false,
+              _counted: true, // 已通过 updateCacheOnAdd 计入统计缓存
             };
 
             this.gifts.push(newGift);
@@ -4502,12 +4829,13 @@
             // 跳转到新记录所在页
             const newIndex = this.gifts.findIndex((g) => g.id === newGiftId);
             if (newIndex !== -1) {
-              this.currentPage = Math.floor(newIndex / app.getItemsPerPage()) + 1;
+              this.currentPage = Math.floor(newIndex / this.getItemsPerPage()) + 1;
             }
 
             this.ui.closeModal();
             this.ui.elements.addGiftForm.reset();
-            document.querySelector('input[name="payment-type"][value="现金"]').checked = true;
+            const cashRadio = document.querySelector('input[name="payment-type"][value="现金"]');
+            if (cashRadio) cashRadio.checked = true;
             this.resetRemarkPresets();
             this.ui.elements.guestNameInput.focus();
             this.giftManager.render();
@@ -4518,6 +4846,8 @@
             this.ui.closeModal();
             console.error("录入失败:", error);
             this.ui.showNotification("录入失败，请重试。", "error");
+          } finally {
+            this.isSavingGift = false;
           }
         }
 
@@ -4532,6 +4862,9 @@
             return;
           }
 
+          // 搜索前确保全部记录已解密，否则未解密记录会被静默漏掉
+          this.giftManager.ensureAllGiftsDecrypted();
+
           const results = [];
           for (let i = 0; i < this.gifts.length; i++) {
             // 确保解密后的 data 存在
@@ -4542,7 +4875,7 @@
           this.ui.elements.searchNameInput.blur();
 
           if (results.length === 0) {
-            this.ui.showNotification(`没有找到姓名为 \"${searchTerm}\" 的记录`);
+            this.ui.showNotification(`没有找到姓名为 \"${Utils.escapeHtml(searchTerm)}\" 的记录`);
             return;
           }
 
@@ -4552,13 +4885,13 @@
               const remarkText = this.formatRemarkDisplay(giftData.remarkData || null);
 
               // 只有当 remarkText 有内容时，才生成备注的HTML
-              const remarkHtml = remarkText ? `<p class="text-sm text-red-500 mt-1"><strong>备注:</strong> ${remarkText}</p>` : "";
+              const remarkHtml = remarkText ? `<p class="text-sm text-red-500 mt-1"><strong>备注:</strong> ${Utils.escapeHtml(remarkText)}</p>` : "";
 
               return `
                         <div class="p-3 border-b flex justify-between items-center">
                           <div>
-                            <p><strong>姓名:</strong> ${giftData.name}</p>
-                            <p><strong>金额:</strong> ${giftData.amount.toFixed(2)} 元 (${giftData.type})</p>
+                            <p><strong>姓名:</strong> ${Utils.escapeHtml(giftData.name)}</p>
+                            <p><strong>金额:</strong> ${giftData.amount.toFixed(2)} 元 (${Utils.escapeHtml(giftData.type)})</p>
                             ${remarkHtml}
                           </div>
                           <button class="view-details-btn themed-button-primary px-3 py-1 rounded" data-gift-index="${r.originalIndex}">查看详情</button>
@@ -4567,7 +4900,7 @@
             })
             .join("");
 
-          this.ui.showModal(`"${searchTerm}" 的搜索结果`, `<div class="max-h-80 overflow-y-auto">${resultsHtml}</div>`, [{ text: "关闭", class: "themed-button-secondary border px-4 py-2 rounded" }]);
+          this.ui.showModal(`"${Utils.escapeHtml(searchTerm)}" 的搜索结果`, `<div class="max-h-80 overflow-y-auto">${resultsHtml}</div>`, [{ text: "关闭", class: "themed-button-secondary border px-4 py-2 rounded" }]);
 
           setTimeout(() => {
             document.querySelectorAll(".view-details-btn").forEach((btn) => {
@@ -4634,7 +4967,7 @@
                             ? `
                           <div class="p-3 bg-red-50  border-red-500 text-red-800 rounded">
                             <p class="font-bold flex items-center"><i class="ri-error-warning-line mr-2"></i>此记录已作废。</p>
-                            <p class="text-sm mt-1"><strong>作废理由：</strong>${g.abolishReason || "无"}</p>
+                            <p class="text-sm mt-1"><strong>作废理由：</strong>${Utils.escapeHtml(g.abolishReason) || "无"}</p>
                             <p class="text-xs text-gray-600 mt-1">作废时间：${new Date(g.abolishTime).toLocaleString("zh-CN")}</p>
                           </div>
                         `
@@ -4643,7 +4976,7 @@
 
                         <div id="name-display-area" class="flex justify-between items-center p-2 hover:bg-gray-50 rounded ${isAbolished ? "opacity-60" : ""}">
                           <div class="flex items-center gap-3 flex-wrap">
-                            <div><strong>姓名:</strong> <span class="text-lg ml-2">${g.name}</span></div>
+                            <div><strong>姓名:</strong> <span class="text-lg ml-2">${Utils.escapeHtml(g.name)}</span></div>
                             ${
                               !isAbolished
                                 ? `
@@ -4719,7 +5052,7 @@
                 { text: "关闭", class: "themed-button-secondary border px-4 py-2 rounded" },
               ];
 
-          this.ui.showModal(`${g.name} 的礼金详情 ${hasHistory ? '<p class="text-sm text-orange-600 font-normal">（警告：此宾客数据存在修改，请自行验证数据真实性！）</p>' : ""}`, modalContent, modalButtons);
+          this.ui.showModal(`${Utils.escapeHtml(g.name)} 的礼金详情 ${hasHistory ? '<p class="text-sm text-orange-600 font-normal">（警告：此宾客数据存在修改，请自行验证数据真实性！）</p>' : ""}`, modalContent, modalButtons);
 
           // 绑定编辑和作废按钮事件
           setTimeout(() => {
@@ -4742,11 +5075,11 @@
                   const newLevelName = CONFIG.GUEST_LEVELS[newLevel];
 
                   // 需要验证密码，但支持N分钟免密
-                  const password = await this.requestAdminPassword("修改宾客等级", `即将把 "${g.name}" 从 "${oldLevelName}" 修改为 "${newLevelName}"`, null);
+                  const password = await this.requestAdminPassword("修改宾客等级", `即将把 "${Utils.escapeHtml(g.name)}" 从 "${oldLevelName}" 修改为 "${newLevelName}"`);
 
                   if (password === null) {
-                    // 用户取消，恢复原来的值
-                    e.target.value = oldLevel;
+                    // 用户取消：密码弹窗已销毁详情弹窗，需重新打开以恢复可交互状态
+                    setTimeout(() => this.showGiftDetails(giftIndex), 150);
                     return;
                   }
 
@@ -5686,6 +6019,10 @@
         async updateGuestLevel(giftIndex, newLevel, oldLevel) {
           try {
             const giftObject = this.gifts[giftIndex];
+            if (!giftObject || !giftObject.data) {
+              this.ui.showNotification("记录尚未解密，无法修改等级。", "error");
+              return;
+            }
             const currentData = { ...giftObject.data };
             const now = new Date().toISOString();
             const newlevelUpdateTime = Date.now();
@@ -5727,8 +6064,9 @@
             this.giftManager.sortGiftsByLevel();
 
             const newIndex = this.gifts.findIndex((g) => g.id === updatedGiftId);
-            this.currentPage = newIndex !== -1 ? Math.floor(newIndex / app.getItemsPerPage()) + 1 : this.currentPage;
+            this.currentPage = newIndex !== -1 ? Math.floor(newIndex / this.getItemsPerPage()) + 1 : this.currentPage;
             this.giftManager.render();
+            this.guestScreenService.syncToGuestScreen(); // 等级变化触发重排，副屏顺序需同步更新
 
             this.ui.closeModal();
             setTimeout(() => this.showGiftDetails(newIndex, { fromStats: false }), 150);
@@ -5742,10 +6080,10 @@
         /**
          * 统一的管理员密码校验方法
          * @param {string} title - 弹窗标题
-         * @param {string} message - 提示信息
+         * @param {string} message - 提示信息（支持HTML，调用方需自行转义用户数据）
          * @param {string} expectedHash - 期望的密码哈希值（可选，默认使用当前事项）
          * @param {boolean} forceVerify - 是否强制验证（true 时必须输入密码，不使用免密缓存）
-         * @returns {Promise<string|null>} 返回原始密码（成功）或 null（取消/错误）
+         * @returns {Promise<string|null>} 返回原始密码（成功）或 null（取消/关闭弹窗）
          */
         async requestAdminPassword(title, message = "", expectedHash = null, forceVerify = false) {
           const hashToCompare = expectedHash || this.currentEvent.passwordHash;
@@ -5758,53 +6096,69 @@
             }
           }
 
+          const minutes = CONFIG.PASSWORD_CACHE_DURATION;
           return new Promise((resolve) => {
             this.ui.elements.modal.classList.remove("modal-large");
             const content = `
                         ${(message && `<p class="text-sm text-gray-600 mb-3">${message}</p>`) || ""}
                         <input type="password" id="admin-pwd-input" class="w-full p-2 border rounded themed-ring" placeholder="请输入管理密码">
+                        ${
+                          !forceVerify
+                            ? `<label class="flex items-center mt-3 cursor-pointer select-none">
+                                 <input type="checkbox" id="skip-verify-5min" class="w-4 h-4 rounded themed-ring cursor-pointer">
+                                 <span class="ml-2 text-sm text-gray-600 whitespace-nowrap">${minutes}分钟内不再校验管理密码</span>
+                               </label>`
+                            : ""
+                        }
                       `;
 
-            this.ui.showModal(title, content, [
-              { text: "取消", class: "themed-button-secondary border px-4 py-2 rounded", handler: () => resolve(null) },
-              {
-                text: "确认",
-                class: "themed-button-primary px-4 py-2 rounded",
-                handler: () => {
-                  const inputPassword = document.getElementById("admin-pwd-input").value;
-                  const isCorrect = CryptoService.hash(inputPassword) === hashToCompare;
+            let settled = false;
+            const settle = (value) => {
+              if (settled) return;
+              settled = true;
+              resolve(value);
+            };
 
-                  if (isCorrect) {
-                    // 如果勾选了N分钟免密，则缓存密码
-                    if (!forceVerify) {
-                      const skipVerify = document.getElementById("skip-verify-5min")?.checked;
-                      if (skipVerify) {
+            this.ui.showModal(
+              title,
+              content,
+              [
+                { text: "取消", class: "themed-button-secondary border px-4 py-2 rounded", handler: () => settle(null) },
+                {
+                  text: "确认",
+                  class: "themed-button-primary px-4 py-2 rounded",
+                  keepOpen: true,
+                  handler: () => {
+                    const pwdInput = document.getElementById("admin-pwd-input");
+                    const inputPassword = pwdInput?.value || "";
+                    const isCorrect = CryptoService.hash(inputPassword) === hashToCompare;
+
+                    if (isCorrect) {
+                      // 如果勾选了N分钟免密，则缓存密码
+                      if (!forceVerify && document.getElementById("skip-verify-5min")?.checked) {
                         this.cacheAdminPassword(inputPassword, hashToCompare);
                       }
+                      settle(inputPassword);
+                      this.ui.closeModal();
+                    } else {
+                      // 密码错误：保持弹窗打开允许重试（关闭会导致调用方丢失上下文，如整个录入表单）
+                      this.ui.showNotification("密码错误，请重新输入。", "error");
+                      pwdInput.value = "";
+                      pwdInput?.focus();
                     }
-                    resolve(inputPassword); // 返回原始密码
-                  } else {
-                    this.ui.showNotification("密码错误，请重新输入。", "error");
-                    resolve(null); // 密码错误
-                  }
+                  },
                 },
-              },
-            ]);
+              ],
+              {
+                // X 按钮 / Esc 关闭弹窗时也要释放等待中的 Promise，避免流程永久挂起
+                onClose: () => settle(null),
+              }
+            );
 
             setTimeout(() => {
-              // 将复选框添加到 modal-actions 左侧
-              if (!forceVerify) {
-                const actionsContainer = this.ui.elements.modalActions;
-                const checkboxDiv = document.createElement("div");
-                checkboxDiv.className = "flex items-center mr-auto";
-                const minutes = CONFIG.PASSWORD_CACHE_DURATION;
-                checkboxDiv.innerHTML = `
-                            <input type="checkbox" id="skip-verify-5min" class="w-4 h-4  rounded themed-ring cursor-pointer">
-                            <label for="skip-verify-5min" class="ml-2 text-sm text-gray-600 cursor-pointer select-none whitespace-nowrap">${minutes}分钟内不再校验管理密码</label>
-                          `;
-                actionsContainer.insertBefore(checkboxDiv, actionsContainer.firstChild);
-              }
-              document.getElementById("admin-pwd-input")?.focus();
+              const pwdInput = document.getElementById("admin-pwd-input");
+              pwdInput?.focus();
+              // 密码框内回车直接提交（全局键盘处理对 password 输入框放行 primary）
             }, 50);
           });
         }
@@ -5915,7 +6269,7 @@
                         <input type="text" class="flex-1 p-2 border rounded themed-ring"
                               data-remark-type="${preset}"
                               placeholder="请输入${remarkConfig.label}"
-                              value="${currentValues[preset] || ""}">
+                              value="${Utils.escapeHtml(currentValues[preset] || "")}">
                       `;
                 container.appendChild(inputDiv);
               }
@@ -5965,14 +6319,14 @@
               return `
                         <div class="mt-2">
                           <label class="font-medium text-gray-700 block mb-1">${label}：</label>
-                          <textarea data-remark-type="${key}" class="w-full p-2 border rounded themed-ring" rows="2" placeholder="${placeholder}">${value}</textarea>
+                          <textarea data-remark-type="${key}" class="w-full p-2 border rounded themed-ring" rows="2" placeholder="${placeholder}">${Utils.escapeHtml(value)}</textarea>
                         </div>
                       `;
             } else {
               return `
                         <div class="flex items-center">
                           <label class="font-medium text-gray-700 w-12">${label}：</label>
-                          <input type="text" data-remark-type="${key}" class="flex-1 p-2 border rounded themed-ring" placeholder="${placeholder}" value="${value}">
+                          <input type="text" data-remark-type="${key}" class="flex-1 p-2 border rounded themed-ring" placeholder="${placeholder}" value="${Utils.escapeHtml(value)}">
                         </div>
                       `;
             }
@@ -6035,9 +6389,9 @@
           this.REMARK_LABELS.forEach(({ key, label }) => {
             if (normalized[key]) {
               if (key === "custom") {
-                html += `<div class="mb-2">${normalized[key]}</div>`;
+                html += `<div class="mb-2">${Utils.escapeHtml(normalized[key])}</div>`;
               } else {
-                gridItems.push(`<div><span class="text-sm font-bold">${label}：</span>${normalized[key]}</div>`);
+                gridItems.push(`<div><span class="text-sm font-bold">${label}：</span>${Utils.escapeHtml(normalized[key])}</div>`);
               }
             }
           });
@@ -6152,7 +6506,7 @@
         <div class="space-y-4">
           <div>
             <label for="edit-event-name-input" class="block text-sm font-medium text-gray-700">事项名称</label>
-            <input type="text" id="edit-event-name-input" class="w-full mt-1 p-2 border rounded themed-ring" value="${this.currentEvent.name || ""}">
+            <input type="text" id="edit-event-name-input" class="w-full mt-1 p-2 border rounded themed-ring" value="${Utils.escapeHtml(this.currentEvent.name || "")}">
           </div>
 
           <div>
@@ -6328,18 +6682,22 @@
           if (this.gifts.length === 0) {
             const password = await this.requestAdminPassword(
               "删除确认",
-              `<p>此操作将永久删除事项 \"<strong>${this.currentEvent.name}</strong>\"，无法恢复。</p>
+              `<p>此操作将永久删除事项 \"<strong>${Utils.escapeHtml(this.currentEvent.name)}</strong>\"，无法恢复。</p>
                       <p class=\"mt-4\">请输入管理密码以确认：</p>`,
-              null
+              null,
+              true
             );
 
             if (password === null) return;
 
             try {
-              await this.giftRepository.deleteEvent(this.currentEvent.id);
+              const eventId = this.currentEvent.id;
+              // 即使内存中无记录，也按 eventId 清理数据库，防止加载未完成时留下永远无法访问的孤儿密文
+              await this.giftRepository.deleteGiftsByEvent(eventId);
+              await this.giftRepository.deleteEvent(eventId);
               this.session.clear();
-              this.passwordCache.clear(this.currentEvent.id);
-              this.ui.showNotification(`事项 "${this.currentEvent.name}" 已被成功删除。`, "success");
+              this.passwordCache.clear(eventId);
+              this.ui.showNotification(`事项 "${Utils.escapeHtml(this.currentEvent.name)}" 已被成功删除。`, "success");
 
               setTimeout(() => {
                 this.currentEvent = null;
@@ -6396,9 +6754,9 @@
               text: "导出Excel备份",
               class: "themed-button-secondary border px-4 py-2 rounded",
               id: "btn-export-excel",
-              handler: () => {
-                this.exportService.exportToExcel();
-                hasExported = true;
+              handler: async () => {
+                await this.exportService.exportToExcel();
+                hasExported = true; // 导出完成后才放行删除，避免导出失败也通过门槛
                 setTimeout(updateDeleteButtonState, 10);
               },
               keepOpen: true,
@@ -6414,20 +6772,18 @@
                   this.ui.showNotification("请先导出 Excel，并勾选确认后再继续。", "error");
                   return;
                 }
-                const password = await this.requestAdminPassword("删除确认", `此操作将永久删除事项 \"<strong>${this.currentEvent.name}</strong>\" 及其所有礼金记录，且无法恢复。请输入管理密码以确认。`, null, true);
+                const password = await this.requestAdminPassword("删除确认", `此操作将永久删除事项 \"<strong>${Utils.escapeHtml(this.currentEvent.name)}</strong>\" 及其所有礼金记录，且无法恢复。请输入管理密码以确认。`, null, true);
                 if (password === null) return;
 
                 try {
                   const eventId = this.currentEvent.id;
-                  const allGifts = await this.giftRepository.fetchGiftsByEvent(eventId);
-                  for (const gift of allGifts) {
-                    await this.giftRepository.deleteGift(gift.id);
-                  }
+                  // 单事务批量删除全部礼金，再删除事项本身
+                  await this.giftRepository.deleteGiftsByEvent(eventId);
                   await this.giftRepository.deleteEvent(eventId);
 
                   this.session.clear();
                   this.passwordCache.clear(eventId);
-                  this.ui.showNotification(`事项 "${this.currentEvent.name}" 已被成功删除。`, "success");
+                  this.ui.showNotification(`事项 "${Utils.escapeHtml(this.currentEvent.name)}" 已被成功删除。`, "success");
 
                   setTimeout(() => {
                     this.currentEvent = null;
