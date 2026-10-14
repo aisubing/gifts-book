@@ -15,20 +15,25 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
+
+const maxStoreSize = 64 << 20 // 单个备份文件上限 64MB
 
 func main() {
 	exeDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
@@ -69,6 +74,19 @@ func main() {
 
 	mux := http.NewServeMux()
 	fileServer := http.FileServer(http.Dir(root))
+
+	// 本地数据文件存储 API：礼簿应用把加密快照自动备份到 <root>/data/ 目录
+	dataDir := filepath.Join(root, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "警告：无法创建数据目录 %s：%v（自动备份不可用，静态服务不受影响）\n", dataDir, err)
+	} else {
+		api := &storeAPI{dir: dataDir}
+		mux.HandleFunc("GET /api/store", api.guard(api.list))
+		mux.HandleFunc("GET /api/store/{name}", api.guard(api.get))
+		mux.HandleFunc("PUT /api/store/{name}", api.guard(api.put))
+		mux.HandleFunc("DELETE /api/store/{name}", api.guard(api.delete))
+	}
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// "/" 与 "/index.html" 直接返回文件内容。不用 http.ServeFile——它对
 		// 以 /index.html 结尾的 URL 也会做规范化 301 跳转（与静态跳转形成死循环），
@@ -183,4 +201,161 @@ func waitExit(code int) {
 	fmt.Println("按回车键关闭窗口…")
 	fmt.Scanln()
 	os.Exit(code)
+}
+
+// ==================== 本地数据文件存储 API ====================
+
+type storeAPI struct {
+	dir string
+}
+
+// guard 为 API 请求做本地安全校验：
+//  1. Host 校验：只接受 127.0.0.1 / localhost / ::1，防御 DNS rebinding
+//     （攻击者域名解析到 127.0.0.1 时 Host 头是其自身域名，会被拒绝）
+//  2. Origin 校验：浏览器请求必带 Origin 时，其主机必须是本机
+//  3. 跨源写防护主要依赖 CORS 预检机制（本服务不返回任何 CORS 头，
+//     恶意网页的 PUT/DELETE 会被浏览器拦截；GET 响应同样不可被跨源读取）
+func (api *storeAPI) guard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !isLocalHost(hostOnly(r.Host)) {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+		if o := r.Header.Get("Origin"); o != "" {
+			// Origin 形如 http://127.0.0.1:8765，用 URL 解析取主机名
+			u, err := url.Parse(o)
+			if err != nil || !isLocalHost(u.Hostname()) {
+				http.Error(w, "forbidden origin", http.StatusForbidden)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+func hostOnly(s string) string {
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		return h
+	}
+	return s
+}
+
+func isLocalHost(h string) bool {
+	h = strings.Trim(h, "[]")
+	return h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+// validName 限制文件名字符集（字母/数字/汉字/._-），杜绝路径穿越
+func validName(name string) bool {
+	if name == "" || len(name) > 120 || strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.' || r == '_' || r == '-':
+		case r >= 0x4e00 && r <= 0x9fff: // 汉字
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (api *storeAPI) list(w http.ResponseWriter, r *http.Request) {
+	entries, err := os.ReadDir(api.dir)
+	if err != nil {
+		jsonError(w, "read dir failed", http.StatusInternalServerError)
+		return
+	}
+	files := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, map[string]any{
+			"name":     e.Name(),
+			"size":     info.Size(),
+			"modified": info.ModTime().UTC().Format(time.RFC3339),
+		})
+	}
+	writeJSON(w, map[string]any{"files": files})
+}
+
+func (api *storeAPI) get(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !validName(name) {
+		http.Error(w, "bad name", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, filepath.Join(api.dir, name))
+}
+
+func (api *storeAPI) put(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !validName(name) {
+		http.Error(w, "bad name", http.StatusBadRequest)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxStoreSize)
+	tmp, err := os.CreateTemp(api.dir, ".tmp-*")
+	if err != nil {
+		jsonError(w, "write failed", http.StatusInternalServerError)
+		return
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.ReadFrom(r.Body); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		if strings.Contains(err.Error(), "request body too large") {
+			jsonError(w, "too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		jsonError(w, "write failed", http.StatusInternalServerError)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		jsonError(w, "write failed", http.StatusInternalServerError)
+		return
+	}
+	// 原子替换：断电/中断不会留下半个文件
+	if err := os.Rename(tmpPath, filepath.Join(api.dir, name)); err != nil {
+		os.Remove(tmpPath)
+		jsonError(w, "write failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (api *storeAPI) delete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !validName(name) {
+		http.Error(w, "bad name", http.StatusBadRequest)
+		return
+	}
+	err := os.Remove(filepath.Join(api.dir, name))
+	if err != nil && !os.IsNotExist(err) {
+		jsonError(w, "delete failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(v)
+}
+
+func jsonError(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]any{"error": msg})
 }

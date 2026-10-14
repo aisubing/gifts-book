@@ -1437,6 +1437,8 @@
          */
         constructor(database) {
           this.database = database;
+          /** 数据变更钩子（eventId） => void，由 GiftBookApp 接线到自动备份服务 */
+          this.onDataChanged = null;
         }
 
         /**
@@ -1460,7 +1462,9 @@
         /**
          */
         async updateEvent(event) {
-          return this.database.update("events", event);
+          const result = await this.database.update("events", event);
+          this.onDataChanged?.(event.id);
+          return result;
         }
 
         /**
@@ -1484,13 +1488,17 @@
         /**
          */
         async createGift(gift) {
-          return this.database.add("gifts", gift);
+          const id = await this.database.add("gifts", gift);
+          this.onDataChanged?.(gift.eventId);
+          return id;
         }
 
         /**
          */
         async updateGift(gift) {
-          return this.database.update("gifts", gift);
+          const result = await this.database.update("gifts", gift);
+          this.onDataChanged?.(gift.eventId);
+          return result;
         }
 
         /**
@@ -2343,7 +2351,7 @@
 
           // 少量数据直接打印
           const selectedEngine = app.currentEvent.printOptions?.pdfEngine || "browser";
-          const shouldUsePdfLib = Utils.isMobile() || selectedEngine === "pdf-lib";
+          const shouldUsePdfLib = (Utils.isMobile() || selectedEngine === "pdf-lib") && app.canUsePdfLibEngine();
 
           if (shouldUsePdfLib) {
             // 移动端或强制 PDF-LIB 情况下直接生成 PDF
@@ -2396,7 +2404,7 @@
                 el.classList.add("cursor-wait");
 
                 const selectedEngine = app.currentEvent.printOptions?.pdfEngine || "browser";
-                const usePdfLib = Utils.isMobile() || selectedEngine === "pdf-lib";
+                const usePdfLib = (Utils.isMobile() || selectedEngine === "pdf-lib") && app.canUsePdfLibEngine();
                 let success = false;
                 if (usePdfLib) {
                   success = await app.exportService.generatePdf(start, end, partIndex);
@@ -2758,69 +2766,80 @@
          *   - 4:   版本号 (0x01)
          *   - 5-7: 保留字节
          */
+        /**
+         * 构建事项的加密备份字节流（EGLB 格式：8字节头 + AES 密文）
+         * 供手动导出与本地文件自动备份共用
+         * @param {number} eventId - 事项 ID
+         * @returns {Promise<Uint8Array>}
+         */
+        async buildBackupBytes(eventId) {
+          const app = this.app;
+          const MAGIC_HEADER = [0x45, 0x47, 0x4c, 0x42]; // "EGLB"
+          const FILE_VERSION = 0x01;
+          const HEADER_LENGTH = 8;
+
+          // 获取礼金数据：直接复用数据库中已有的密文（同一密码下重新加解密是纯开销）
+          const rawGifts = await app.giftRepository.fetchGiftsByEvent(eventId);
+
+          const sanitizedGifts = rawGifts.map((gift) => {
+            if (!gift.encryptedData) {
+              throw new Error("missing_ciphertext");
+            }
+            return {
+              encryptedData: gift.encryptedData,
+              guestLevelWeight: gift.guestLevelWeight ?? 0,
+              levelUpdateTime: gift.levelUpdateTime ?? 0,
+            };
+          });
+
+          // 准备导出数据（移除密码哈希）
+          const safeEvent = { ...app.currentEvent };
+          if (safeEvent.id !== eventId) delete safeEvent.id;
+          delete safeEvent.passwordHash;
+
+          const payload = {
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            event: safeEvent,
+            gifts: sanitizedGifts,
+          };
+
+          // 加密整个 payload
+          const encryptedPayloadString = CryptoService.encrypt(JSON.stringify(payload), app.currentPassword);
+
+          // 构建文件头
+          const header = new Uint8Array(HEADER_LENGTH);
+          header.set(MAGIC_HEADER, 0); // 字节 0-3: Magic Number
+          header[4] = FILE_VERSION; // 字节 4: 版本号
+          header[5] = 0x00; // 字节 5-7: 保留
+          header[6] = 0x00;
+          header[7] = 0x00;
+
+          // 将 Base64 密文转换为原始字节流
+          const binaryString = atob(encryptedPayloadString);
+          const payloadBytes = new Uint8Array(binaryString.length);
+          for (let i = 0; i < binaryString.length; i++) {
+            payloadBytes[i] = binaryString.charCodeAt(i);
+          }
+
+          // 组合文件头和数据体
+          const finalBuffer = new Uint8Array(header.length + payloadBytes.length);
+          finalBuffer.set(header, 0);
+          finalBuffer.set(payloadBytes, header.length);
+          return finalBuffer;
+        }
+
         async exportEventAsBinary() {
           const app = this.app;
           if (!app.currentEvent) return;
 
           try {
-            // 定义文件格式常量
-            const MAGIC_HEADER = [0x45, 0x47, 0x4c, 0x42]; // "EGLB"
-            const FILE_VERSION = 0x01;
-            const HEADER_LENGTH = 8;
-
-            // 获取礼金数据：直接复用数据库中已有的密文（同一密码下重新加解密是纯开销）
-            const eventId = app.currentEvent.id;
-            const rawGifts = await app.giftRepository.fetchGiftsByEvent(eventId);
-
-            const sanitizedGifts = rawGifts.map((gift) => {
-              if (!gift.encryptedData) {
-                throw new Error("missing_ciphertext");
-              }
-              return {
-                encryptedData: gift.encryptedData,
-                guestLevelWeight: gift.guestLevelWeight ?? 0,
-                levelUpdateTime: gift.levelUpdateTime ?? 0,
-              };
-            });
-
-            // 准备导出数据（移除密码哈希）
-            const safeEvent = { ...app.currentEvent };
-            delete safeEvent.passwordHash;
-
-            const payload = {
-              version: 1,
-              exportedAt: new Date().toISOString(),
-              event: safeEvent,
-              gifts: sanitizedGifts,
-            };
-
-            // 加密整个 payload
-            const encryptedPayloadString = CryptoService.encrypt(JSON.stringify(payload), app.currentPassword);
+            const finalBuffer = await this.buildBackupBytes(app.currentEvent.id);
 
             // 生成文件名
             const safeName = (app.currentEvent.name || "event").replace(/[\\/:*?"<>|]/g, "_");
             const timestamp = Utils.formatTimestampForFilename();
             const filename = `${safeName}_${timestamp}.bin`;
-
-            // 构建文件头
-            const header = new Uint8Array(HEADER_LENGTH);
-            header.set(MAGIC_HEADER, 0); // 字节 0-3: Magic Number
-            header[4] = FILE_VERSION; // 字节 4: 版本号
-            header[5] = 0x00; // 字节 5-7: 保留
-            header[6] = 0x00;
-            header[7] = 0x00;
-
-            // 将 Base64 密文转换为原始字节流
-            const binaryString = atob(encryptedPayloadString);
-            const payloadBytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              payloadBytes[i] = binaryString.charCodeAt(i);
-            }
-
-            // 组合文件头和数据体
-            const finalBuffer = new Uint8Array(header.length + payloadBytes.length);
-            finalBuffer.set(header, 0);
-            finalBuffer.set(payloadBytes, header.length);
 
             // 创建 Blob 并下载
             const blob = new Blob([finalBuffer], { type: "application/octet-stream" });
@@ -2853,6 +2872,23 @@
 
           // 在弹出其他验证弹窗之前缓存复选框状态，避免 DOM 被替换后读取失败
           const shouldClearOldData = !!document.getElementById("clear-old-data-on-import")?.checked;
+          const fileBytes = new Uint8Array(await file.arrayBuffer());
+          await this.importEventFromBytes(fileBytes, { shouldClearOldData });
+        }
+
+        /**
+         * 从备份字节流导入（EGLB 格式）。手动导入与本地文件自动恢复共用入口
+         * @param {Uint8Array} fileBytes - 备份文件字节流
+         * @param {Object} [options]
+         *   - shouldClearOldData: 导入前清空当前事项旧数据（默认 false）
+         *   - knownPassword: 已知密码（自动恢复路径），跳过密码弹窗；解密失败直接放弃返回 null
+         * @returns {Promise<number|null>} 导入的记录数；用户取消/解密失败/格式错误返回 null
+         */
+        async importEventFromBytes(fileBytes, options = {}) {
+          const app = this.app;
+          if (!app.currentEvent || !fileBytes || !fileBytes.length) return null;
+          const shouldClearOldData = options.shouldClearOldData ?? false;
+          const knownPassword = options.knownPassword ?? null;
 
           try {
             // 定义文件格式常量
@@ -2860,31 +2896,30 @@
             const FILE_VERSION = 0x01;
             const HEADER_LENGTH = 8;
 
-            // 步骤1：验证当前事项的管理密码
-            const currentEventPassword = await app.requestAdminPassword("导入验证", "请输入当前事项的管理密码以继续。", app.currentEvent.passwordHash, true);
-            if (currentEventPassword === null) return;
+            // 步骤1：确定解密密码
+            let currentEventPassword = knownPassword;
+            if (!currentEventPassword) {
+              currentEventPassword = await app.requestAdminPassword("导入验证", "请输入当前事项的管理密码以继续。", app.currentEvent.passwordHash, true);
+              if (currentEventPassword === null) return null;
+            }
 
-            // 步骤2：读取并验证文件格式
-            const arrayBuffer = await file.arrayBuffer();
-            const fileBytes = new Uint8Array(arrayBuffer);
-
-            // 验证文件最小长度
+            // 步骤2：验证文件格式
             if (fileBytes.length < HEADER_LENGTH) {
-              app.ui.showNotification("文件格式错误：文件过小。", "error");
-              return;
+              if (!knownPassword) app.ui.showNotification("文件格式错误：文件过小。", "error");
+              return null;
             }
 
             // 验证 Magic Number
             if (fileBytes[0] !== MAGIC_HEADER[0] || fileBytes[1] !== MAGIC_HEADER[1] || fileBytes[2] !== MAGIC_HEADER[2] || fileBytes[3] !== MAGIC_HEADER[3]) {
-              app.ui.showNotification("文件格式错误：不是有效的备份文件。", "error");
-              return;
+              if (!knownPassword) app.ui.showNotification("文件格式错误：不是有效的备份文件。", "error");
+              return null;
             }
 
             // 验证版本号
             const version = fileBytes[4];
             if (version > FILE_VERSION) {
-              app.ui.showNotification(`文件版本 (v${version}) 过高，当前系统最高支持 v${FILE_VERSION}。`, "error");
-              return;
+              if (!knownPassword) app.ui.showNotification(`文件版本 (v${version}) 过高，当前系统最高支持 v${FILE_VERSION}。`, "error");
+              return null;
             }
 
             // 步骤3：提取并解密数据（密文已为原始字节流）
@@ -2901,8 +2936,9 @@
             let decrypted = CryptoService.decrypt(encryptedContent, currentEventPassword);
             let finalPassword = currentEventPassword;
 
-            // 如果解密失败，要求输入备份文件的密码
+            // 如果解密失败，要求输入备份文件的密码（自动恢复路径不弹窗，直接放弃）
             if (!decrypted) {
+              if (knownPassword) return null;
               const backupPassword = await new Promise((resolve) => {
                 const content = `
                         <p class="text-sm text-yellow-700 bg-yellow-50 p-3 rounded-md mb-3">
@@ -3029,9 +3065,13 @@
               importMessage += `另有 ${skippedCount} 条记录无法解密被跳过。`;
             }
             app.ui.showNotification(importMessage, "success");
+            return importedCount;
           } catch (error) {
             console.error("导入备份失败:", error);
-            app.ui.showNotification("导入失败，文件格式可能无效或已损坏。", "error");
+            if (!knownPassword) {
+              app.ui.showNotification("导入失败，文件格式可能无效或已损坏。", "error");
+            }
+            return null;
           }
         }
         /**
@@ -3040,6 +3080,16 @@
         showBackupRestoreModal() {
           const app = this.app;
           if (!app.currentEvent) return;
+
+          const ab = app.autoBackup;
+          const autoBackupAvailable = ab.available;
+          const autoBackupHtml = `
+                          <div class="border-t pt-4 space-y-3">
+                            <label class="block text-sm font-medium text-gray-700">本地自动备份</label>
+                            <p class="text-xs ${autoBackupAvailable ? "text-green-700 bg-green-50" : "text-gray-600 bg-gray-50"} rounded p-2">${Utils.escapeHtml(ab.statusText())}${autoBackupAvailable && ab.lastError ? `<br><span class="text-red-600">最近一次备份失败：${Utils.escapeHtml(ab.lastError)}</span>` : ""}</p>
+                            <button id="btn-restore-local" class="w-full themed-button-secondary border px-4 py-2 rounded">查看本地备份文件并恢复…</button>
+                            <p class="text-xs text-gray-500">换端口、换浏览器或清理浏览器数据后，进入事项时会尝试从这些文件自动恢复。</p>
+                          </div>`;
 
           const modalContent = `
                         <div class="space-y-5 text-left">
@@ -3061,6 +3111,7 @@
                             <button id="btn-restore-backup" class="w-full themed-button-primary px-4 py-2 rounded">导入并恢复</button>
                             <p class="text-xs text-gray-500">导入时需输入当前事项的管理密码，请确保备份来源可靠。</p>
                           </div>
+                          ${autoBackupHtml}
                         </div>
                       `;
 
@@ -3071,6 +3122,10 @@
             const exportBinBtn = document.getElementById("btn-backup-bin");
             const restoreBtn = document.getElementById("btn-restore-backup");
             const fileInput = document.getElementById("backup-import-file");
+            const restoreLocalBtn = document.getElementById("btn-restore-local");
+            if (restoreLocalBtn) {
+              restoreLocalBtn.addEventListener("click", () => this.showLocalRestoreListModal());
+            }
 
             if (exportJsonBtn) {
               exportJsonBtn.addEventListener("click", async () => {
@@ -3099,6 +3154,62 @@
                 restoreBtn.disabled = false;
               });
             }
+          }, 50);
+        }
+
+        /**
+         * 列出 data/ 目录的本地自动备份文件，点击即恢复
+         */
+        async showLocalRestoreListModal() {
+          const app = this.app;
+          const ab = app.autoBackup;
+          if (!ab.available) {
+            app.ui.showNotification("本地自动备份不可用（未通过 gifts-book-server 启动）。", "error");
+            return;
+          }
+          let files = [];
+          try {
+            files = (await ab.list()).files.filter((f) => f.name.endsWith(".bin"));
+          } catch (e) {
+            app.ui.showNotification("读取本地备份列表失败。", "error");
+            return;
+          }
+
+          const rows = files
+            .map(
+              (f) => `
+                      <div class="p-3 border rounded-lg flex justify-between items-center hover:bg-gray-50 local-restore-item cursor-pointer" data-name="${Utils.escapeHtml(f.name)}">
+                        <div>
+                          <p class="font-medium text-sm">${Utils.escapeHtml(f.name)}</p>
+                          <p class="text-xs text-gray-500">${(f.size / 1024).toFixed(1)} KB · ${new Date(f.modified).toLocaleString("zh-CN")}</p>
+                        </div>
+                        <span class="text-sm themed-text">恢复</span>
+                      </div>`
+            )
+            .join("");
+          const content = rows
+            ? `<div class="space-y-2 max-h-80 overflow-y-auto text-left">${rows}</div>
+               <p class="text-xs text-gray-500 mt-3">恢复会替换当前事项的数据，并还原备份时的事项设置，需输入当前事项管理密码。</p>`
+            : `<p class="text-sm text-gray-500">data/ 目录下暂无备份文件。录入数据后会自动生成。</p>`;
+          app.ui.showModal("本地备份文件", content, [{ text: "返回", class: "themed-button-secondary border px-4 py-2 rounded" }]);
+
+          if (!rows) return;
+          setTimeout(() => {
+            document.querySelectorAll(".local-restore-item").forEach((el) => {
+              el.onclick = async () => {
+                const name = el.dataset.name;
+                try {
+                  const bytes = await ab.loadFile(name);
+                  const imported = await app.exportService.importEventFromBytes(bytes, { shouldClearOldData: true });
+                  if (imported !== null) {
+                    app.ui.showNotification(`已从本地文件 ${name} 恢复 ${imported} 条记录。`, "success");
+                  }
+                } catch (e) {
+                  console.error("本地恢复失败:", e);
+                  app.ui.showNotification("读取本地备份文件失败。", "error");
+                }
+              };
+            });
           }, 50);
         }
 
@@ -4083,6 +4194,186 @@
       }
 
       /**
+       * 本地文件自动备份服务
+       * 配合 gifts-book-server 的 /api/store 接口，将每个事项的加密快照自动落盘到
+       * 程序旁 data/ 目录；换端口/换浏览器/清理站点数据后，进入事项时自动恢复。
+       * 未通过该服务器启动（file:// 或其他静态服务器）时自动休眠，零影响
+       */
+      class AutoBackupService {
+        constructor(app) {
+          this.app = app;
+          this.apiBase = "/api/store";
+          this.available = false;
+          this.debounceTimer = null;
+          this.pendingEventIds = new Set();
+          this.lastSavedAt = null;
+          this.lastError = null;
+          this.flushOnHide = null;
+        }
+
+        /** 探测服务器是否提供存储 API */
+        async init() {
+          if (location.protocol !== "http:" && location.protocol !== "https:") return;
+          try {
+            const r = await fetch(this.apiBase, { headers: { Accept: "application/json" } });
+            this.available = r.ok;
+          } catch (e) {
+            this.available = false;
+          }
+        }
+
+        /**
+         * 数据变更后调度落盘（由 GiftRepository.onDataChanged 钩子触发）
+         * 3 秒防抖合并高频写入；页面隐藏时立即冲刷
+         */
+        schedule(eventId) {
+          if (!this.available || !eventId) return;
+          this.pendingEventIds.add(eventId);
+          clearTimeout(this.debounceTimer);
+          this.debounceTimer = setTimeout(() => this.flush(), 3000);
+          if (!this.flushOnHide) {
+            this.flushOnHide = () => {
+              if (document.visibilityState === "hidden") this.flush();
+            };
+            document.addEventListener("visibilitychange", this.flushOnHide);
+          }
+        }
+
+        async flush() {
+          const ids = [...this.pendingEventIds];
+          this.pendingEventIds.clear();
+          for (const id of ids) {
+            if (this.app.currentEvent?.id === id) await this.saveCurrentEvent();
+          }
+        }
+
+        buildFilename(event) {
+          const safeName = (event.name || "event").replace(/[\\/:*?"<>|\s]/g, "_").slice(0, 60);
+          return `${safeName}_event${event.id}.bin`;
+        }
+
+        async saveCurrentEvent() {
+          const app = this.app;
+          if (!this.available || !app.currentEvent || !app.currentPassword) return false;
+          try {
+            const bytes = await app.exportService.buildBackupBytes(app.currentEvent.id);
+            const filename = this.buildFilename(app.currentEvent);
+            const r = await fetch(`${this.apiBase}/${encodeURIComponent(filename)}`, { method: "PUT", body: bytes });
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            // 事项改名后清理同 ID 的旧文件，避免残留重复
+            await this.removeFilesForEvent(app.currentEvent.id, filename);
+            this.lastSavedAt = new Date();
+            this.lastError = null;
+            return true;
+          } catch (e) {
+            this.lastError = e?.message || String(e);
+            console.error("自动备份失败:", e);
+            return false;
+          }
+        }
+
+        async list() {
+          const r = await fetch(this.apiBase);
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        }
+
+        async loadFile(name) {
+          const r = await fetch(`${this.apiBase}/${encodeURIComponent(name)}`);
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return new Uint8Array(await r.arrayBuffer());
+        }
+
+        async deleteFile(name) {
+          try {
+            await fetch(`${this.apiBase}/${encodeURIComponent(name)}`, { method: "DELETE" });
+          } catch (e) {
+            /* 尽力而为 */
+          }
+        }
+
+        /** 删除某事项 ID 对应的全部备份文件（keepFilename 除外） */
+        async removeFilesForEvent(eventId, keepFilename = null) {
+          if (!this.available) return;
+          try {
+            const { files } = await this.list();
+            const pattern = new RegExp(`_event${eventId}\\.`);
+            await Promise.all(files.filter((f) => pattern.test(f.name) && f.name !== keepFilename).map((f) => this.deleteFile(f.name)));
+          } catch (e) {
+            /* 尽力而为 */
+          }
+        }
+
+        /**
+         * 自动恢复：本地事项没有任何礼金记录时（新端口/新浏览器/被清缓存），
+         * 尝试用 data/ 下的备份文件还原。仅恢复能用当前事项密码解开的文件，
+         * 成功后删除旧文件（新快照由数据变更钩子写入当前文件名）
+         */
+        async checkAndRestore() {
+          const app = this.app;
+          if (!this.available || !app.currentEvent || !app.currentPassword) return;
+          if (app.gifts.length > 0) return; // 本地已有数据，无需恢复
+          const flag = `autoRestored_${app.currentEvent.id}`;
+          if (sessionStorage.getItem(flag)) return;
+          sessionStorage.setItem(flag, "1");
+          try {
+            const { files } = await this.list();
+            const currentFile = this.buildFilename(app.currentEvent);
+            // 优先同名文件，其次按修改时间新→旧
+            const sorted = [...files]
+              .filter((f) => f.name.endsWith(".bin"))
+              .sort((a, b) => (a.name === currentFile ? -1 : b.name === currentFile ? 1 : new Date(b.modified) - new Date(a.modified)));
+            for (const f of sorted) {
+              const bytes = await this.loadFile(f.name);
+              // 仅自动恢复与当前事项同名的备份：密码相同不等于同一个事项，
+              // 否则新建的无关事项会被旧备份覆盖
+              if (!this.backupMatchesEvent(bytes, app.currentPassword, app.currentEvent.name)) continue;
+              const imported = await app.exportService.importEventFromBytes(bytes, {
+                knownPassword: app.currentPassword,
+                shouldClearOldData: true,
+              });
+              if (imported !== null) {
+                if (f.name !== currentFile) await this.deleteFile(f.name);
+                app.ui.showNotification(`已从本地备份文件自动恢复 ${imported} 条礼金记录。`, "success");
+                return;
+              }
+            }
+          } catch (e) {
+            console.error("自动恢复检查失败:", e);
+          }
+        }
+
+        /**
+         * 检查备份文件能否用 password 解开、且属于名为 eventName 的事项
+         * @returns {boolean}
+         */
+        backupMatchesEvent(bytes, password, eventName) {
+          try {
+            const HEADER_LENGTH = 8;
+            const payloadBytes = bytes.slice(HEADER_LENGTH);
+            let binaryString = "";
+            const chunkSize = 0x8000;
+            for (let i = 0; i < payloadBytes.length; i += chunkSize) {
+              binaryString += String.fromCharCode(...payloadBytes.subarray(i, i + chunkSize));
+            }
+            const decrypted = CryptoService.decrypt(btoa(binaryString), password);
+            if (!decrypted) return false;
+            const payload = JSON.parse(decrypted);
+            return payload?.event?.name === eventName;
+          } catch (e) {
+            return false;
+          }
+        }
+
+        /** 状态描述（用于备份弹窗展示） */
+        statusText() {
+          if (!this.available) return "不可用：当前未通过 gifts-book-server 启动，数据仅保存在浏览器中。";
+          const t = this.lastSavedAt ? `，最后保存 ${this.lastSavedAt.toLocaleTimeString("zh-CN")}` : "";
+          return `已开启：自动保存到程序旁 data/ 目录${t}。`;
+        }
+      }
+
+      /**
        * GiftBookApp 应用核心
        * - 管理生命周期、事件绑定与数据流转
        */
@@ -4099,6 +4390,9 @@
           this.exportService = new ExportService(this);
           this.statsService = new StatsService(this);
           this.guestScreenService = new GuestScreenService(this);
+          this.autoBackup = new AutoBackupService(this);
+          // 数据变更钩子：礼金/事项的任何成功写入都会调度自动备份
+          this.giftRepository.onDataChanged = (eventId) => this.autoBackup.schedule(eventId);
 
           this.currentEvent = null;
           this.currentPassword = null;
@@ -4135,11 +4429,52 @@
             this.passwordCache.sweepExpired();
             this.setupInitialUI();
             this.bindEvents();
+            await this.autoBackup.init();
             await this.tryRestoreSession();
+            this.checkFileProtocolLimitation();
           } catch (error) {
             console.error("应用初始化失败:", error);
             this.ui.showNotification("系统初始化失败，请刷新后重试。", "error");
           }
+        }
+
+        /**
+         * file:// 直接打开的引导提示
+         * 探测 fetch 是否被浏览器拦截（file:// 下被禁止），据此提示用户
+         * 使用 gifts-book-server.exe 启动以获得 PDF-LIB 精细打印引擎
+         */
+        checkFileProtocolLimitation() {
+          if (location.protocol !== "file:") return;
+          if (this.currentEvent) return; // 已恢复会话时不打断，打印时另有回退提示
+          fetch("./static/tailwindcss.js")
+            .then((r) => {
+              if (!r.ok) this.showFileProtocolHint();
+            })
+            .catch(() => this.showFileProtocolHint());
+        }
+
+        showFileProtocolHint() {
+          if (sessionStorage.getItem("fileProtocolHintShown")) return;
+          sessionStorage.setItem("fileProtocolHintShown", "1");
+          this.ui.showModal(
+            "运行方式提示",
+            `<div class="text-left space-y-2 text-sm">
+                        <p>检测到当前是<b>直接双击打开</b>（file:// 方式）。记账、统计、导出 Excel、副屏等核心功能均可正常使用，但有一项限制：</p>
+                        <p class="text-red-600"><b>PDF-LIB.JS 精细打印引擎</b>无法加载中文字体，打印时将自动改用"浏览器另存为PDF"。</p>
+                        <p>如需完整功能，请改用程序自带的 <b>gifts-book-server.exe</b>：把它放在 index.html 旁边双击，会自动启动本地服务并打开本系统。</p>
+                      </div>`,
+            [{ text: "我已知晓", class: "themed-button-primary px-4 py-2 rounded", role: "secondary" }]
+          );
+        }
+
+        /**
+         * PDF-LIB 引擎可用性检查：file:// 下无法 fetch 字体，回退浏览器打印
+         * @returns {boolean}
+         */
+        canUsePdfLibEngine() {
+          if (location.protocol !== "file:") return true;
+          this.ui.showNotification("file:// 方式下 PDF-LIB 引擎无法加载字体，已改用浏览器打印。请用 gifts-book-server.exe 启动以启用精细 PDF 导出。", "error");
+          return false;
         }
 
         /**
@@ -4250,6 +4585,13 @@
 
           await this.giftManager.loadGiftsForCurrentEvent();
           this.ui.showScreen("main");
+
+          // 本地文件自动备份：优先尝试从 data/ 目录恢复缺失数据；本地有数据时确保快照存在
+          if (this.gifts.length > 0) {
+            this.autoBackup.schedule(this.currentEvent.id);
+          } else {
+            await this.autoBackup.checkAndRestore();
+          }
         }
         /**
          * 显示联系与支持作者弹窗
@@ -6697,6 +7039,7 @@
               await this.giftRepository.deleteEvent(eventId);
               this.session.clear();
               this.passwordCache.clear(eventId);
+              await this.autoBackup.removeFilesForEvent(eventId); // 同步清理本地备份文件
               this.ui.showNotification(`事项 "${Utils.escapeHtml(this.currentEvent.name)}" 已被成功删除。`, "success");
 
               setTimeout(() => {
@@ -6783,6 +7126,7 @@
 
                   this.session.clear();
                   this.passwordCache.clear(eventId);
+                  await this.autoBackup.removeFilesForEvent(eventId); // 同步清理本地备份文件
                   this.ui.showNotification(`事项 "${Utils.escapeHtml(this.currentEvent.name)}" 已被成功删除。`, "success");
 
                   setTimeout(() => {
