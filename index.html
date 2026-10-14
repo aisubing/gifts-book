@@ -4425,13 +4425,18 @@
          */
         async init() {
           try {
+            // 数据安全闸门：只有通过 gifts-book-server 运行（提供本地落盘 API）时才启动应用。
+            // 直接双击 index.html 或用普通静态服务器打开时，数据仅存浏览器、无自动备份，强制不可用
+            await this.autoBackup.init();
+            if (!this.autoBackup.available) {
+              this.renderBlockedScreen();
+              return;
+            }
             await this.dbManager.init();
             this.passwordCache.sweepExpired();
             this.setupInitialUI();
             this.bindEvents();
-            await this.autoBackup.init();
             await this.tryRestoreSession();
-            this.checkFileProtocolLimitation();
           } catch (error) {
             console.error("应用初始化失败:", error);
             this.ui.showNotification("系统初始化失败，请刷新后重试。", "error");
@@ -4439,32 +4444,40 @@
         }
 
         /**
-         * file:// 直接打开的引导提示
-         * 探测 fetch 是否被浏览器拦截（file:// 下被禁止），据此提示用户
-         * 使用 gifts-book-server.exe 启动以获得 PDF-LIB 精细打印引擎
+         * 数据安全阻断页（无任何关闭/继续入口）
+         * 直接双击 index.html 等方式运行时，数据仅存于浏览器：
+         * 清缓存/换浏览器/换端口都会导致数据不可访问，且没有 data/ 自动备份兜底，
+         * 因此强制停止应用，引导用户用 gifts-book-server.exe 启动
          */
-        checkFileProtocolLimitation() {
-          if (location.protocol !== "file:") return;
-          if (this.currentEvent) return; // 已恢复会话时不打断，打印时另有回退提示
-          fetch("./static/tailwindcss.js")
-            .then((r) => {
-              if (!r.ok) this.showFileProtocolHint();
-            })
-            .catch(() => this.showFileProtocolHint());
-        }
-
-        showFileProtocolHint() {
-          if (sessionStorage.getItem("fileProtocolHintShown")) return;
-          sessionStorage.setItem("fileProtocolHintShown", "1");
-          this.ui.showModal(
-            "运行方式提示",
-            `<div class="text-left space-y-2 text-sm">
-                        <p>检测到当前是<b>直接双击打开</b>（file:// 方式）。记账、统计、导出 Excel、副屏等核心功能均可正常使用，但有一项限制：</p>
-                        <p class="text-red-600"><b>PDF-LIB.JS 精细打印引擎</b>无法加载中文字体，打印时将自动改用"浏览器另存为PDF"。</p>
-                        <p>如需完整功能，请改用程序自带的 <b>gifts-book-server.exe</b>：把它放在 index.html 旁边双击，会自动启动本地服务并打开本系统。</p>
-                      </div>`,
-            [{ text: "我已知晓", class: "themed-button-primary px-4 py-2 rounded", role: "secondary" }]
-          );
+        renderBlockedScreen() {
+          document.title = "请使用 gifts-book-server 启动 - 电子礼簿系统";
+          document.body.innerHTML = `
+            <div class="fixed inset-0 z-[99999] bg-gray-100 flex items-center justify-center p-6 overflow-auto">
+              <div class="max-w-xl w-full bg-white rounded-2xl shadow-xl border border-gray-200 p-8 text-gray-800">
+                <div class="flex items-center gap-3 mb-5">
+                  <i class="ri-error-warning-fill text-4xl text-red-500"></i>
+                  <h1 class="text-xl font-bold">请使用 gifts-book-server.exe 启动本系统</h1>
+                </div>
+                <div class="space-y-3 text-sm leading-relaxed">
+                  <p>检测到当前是以<b>直接双击 index.html</b>（或不支持数据落盘的方式）运行。此方式下：</p>
+                  <ul class="list-disc pl-5 space-y-1 text-red-700">
+                    <li>数据<b>仅保存在浏览器内部</b>，清理浏览器数据、更换浏览器、更换端口都会导致数据无法访问；</li>
+                    <li>无法生成 <b>data/ 本地自动备份</b>，误清浏览器数据将造成不可恢复的损失；</li>
+                    <li><b>PDF-LIB 精细打印引擎</b>不可用。</li>
+                  </ul>
+                  <p class="font-bold text-red-600">为保障数据安全，此方式下系统已停止运行。</p>
+                  <div class="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                    <p class="font-bold text-blue-800 mb-2">正确的启动方式：</p>
+                    <ol class="list-decimal pl-5 space-y-1 text-blue-900">
+                      <li>在 index.html 所在目录（或下载的完整包内）找到 <b>gifts-book-server.exe</b>；</li>
+                      <li>双击运行，它会自动启动本地服务并打开浏览器，即可正常使用；</li>
+                      <li>若没有该文件，请从 <a class="underline font-medium" href="https://github.com/aisubing/gifts-book/releases" target="_blank" rel="noopener">GitHub Releases</a> 下载 gifts-book-complete 完整包。</li>
+                    </ol>
+                  </div>
+                  <p class="text-xs text-gray-500">礼金数据无价。本系统为数据安全而强制此要求，感谢理解。</p>
+                </div>
+              </div>
+            </div>`;
         }
 
         /**

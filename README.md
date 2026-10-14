@@ -83,28 +83,19 @@
 
 ---
 
-本系统由纯静态文件组成，**无需安装任何环境**。两种运行方式任选：
+### 启动：双击 gifts-book-server.exe（唯一方式）
 
-### 方式一：双击运行（最简单）
+本系统为保障数据安全，**强制要求通过附带的服务器运行**——直接双击 `index.html` 时应用会拒绝启动并显示指引。
 
-1. **双击 `index.html`**，用 Chrome/Edge 打开即可记账。
-2. 实测在 Chromium 内核浏览器下，核心功能（记账/统计/导出/副屏/浏览器打印引擎）全部可用。
-3. 唯一限制：**PDF-LIB.JS 打印引擎**需要通过 HTTP 加载字体（`file://` 下 `fetch` 被浏览器拦截）。如需使用该引擎，请用方式二。
+1. 从 [Releases](https://github.com/aisubing/gifts-book/releases) 下载 `gifts-book-complete-*.zip` 并解压；
+2. 双击 `gifts-book/gifts-book-server.exe`——自动启动本地服务并打开浏览器；
+3. 端口默认 `8765`（被占用自动换空闲端口）；`-port` / `-dir` / `-addr` / `-open=false` 参数可选。
 
-### 方式二：附带零依赖本地服务器（推荐，完整功能）
+**为什么强制？** 直接双击 `index.html` 时，数据仅保存在浏览器内部：清理浏览器数据、更换浏览器、更换端口都会导致数据无法访问，且没有 `data/` 本地自动备份兜底，PDF-LIB 精细打印引擎也不可用。礼金数据无价，系统在此类方式下会直接停止运行。
 
-仓库 `server/` 目录附赠一个纯 Go 标准库实现的静态服务器（无任何运行时依赖）：
+服务器为纯 Go 标准库单文件（无任何运行时依赖），源码见 [`server/main.go`](server/main.go)，交叉编译：`cd server && ./build.sh`。
 
-1. 从 [Releases](https://github.com/aisubing/gifts-book/releases) 下载 `gifts-book-complete-*.zip`（推荐，解压即用）或单独的 `gifts-book-server-*.exe`（约 5MB）；
-2. 将服务器程序放到 `index.html` 旁边，双击运行——自动启动本地服务并打开浏览器；
-3. 端口默认 `8765`（被占用自动换空闲端口）；`-port` / `-dir` / `-addr` / `-open=false` 参数可选；
-4. 此时 **PDF-LIB.JS 引擎完整可用**（含自定义字体嵌入的精美 PDF 导出），并启用**本地自动备份**。
-
-源码见 [`server/main.go`](server/main.go)，交叉编译：`cd server && ./build.sh`。
-
-> 也可以用任何其他静态服务器代替（如 `python -m http.server`、VS Code Live Server），但自动备份功能为本服务器独有。
-
-### 本地自动备份（随 gifts-book-server 启用）
+### 本地自动备份（启动即自动启用）
 
 通过上述服务器运行时，数据会在浏览器之外多一层保障：
 
@@ -114,7 +105,7 @@
 * **安全**：数据本身 AES 加密；API 仅接受本机访问，拒绝跨源读写；
 * 删除事项时对应的备份文件一并清理（删除流程本身已强制先导出 Excel）。
 
-未通过服务器运行（如直接双击 index.html）时该功能自动休眠，不影响使用；此时数据仅存于浏览器，请务必手动导出备份。
+未通过服务器运行（双击 index.html、普通静态服务器等）时，应用会显示数据风险说明并**拒绝启动**——这是防止用户在无备份保护的状态下记账的强制措施。
 
 ### 初始化
 

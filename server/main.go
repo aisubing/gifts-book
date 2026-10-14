@@ -8,10 +8,11 @@
 // 自动启动服务并打开系统默认浏览器。
 //
 // 可选参数：
-//   -port  int    服务端口，默认 8765（被占用时自动换空闲端口）
-//   -dir   string 静态根目录，默认为本程序所在目录
-//   -addr  string 监听地址，默认 127.0.0.1（仅本机；如需副屏/局域网访问可改为 0.0.0.0）
-//   -open  bool   启动后自动打开浏览器，默认 true
+//
+//	-port  int    服务端口，默认 8765（被占用时自动换空闲端口）
+//	-dir   string 静态根目录，默认为本程序所在目录
+//	-addr  string 监听地址，默认 127.0.0.1（仅本机；如需副屏/局域网访问可改为 0.0.0.0）
+//	-open  bool   启动后自动打开浏览器，默认 true
 package main
 
 import (
@@ -75,19 +76,25 @@ func main() {
 	mux := http.NewServeMux()
 	fileServer := http.FileServer(http.Dir(root))
 
-	// 本地数据文件存储 API：礼簿应用把加密快照自动备份到 <root>/data/ 目录
-	dataDir := filepath.Join(root, "data")
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "警告：无法创建数据目录 %s：%v（自动备份不可用，静态服务不受影响）\n", dataDir, err)
-	} else {
-		api := &storeAPI{dir: dataDir}
-		mux.HandleFunc("GET /api/store", api.guard(api.list))
-		mux.HandleFunc("GET /api/store/{name}", api.guard(api.get))
-		mux.HandleFunc("PUT /api/store/{name}", api.guard(api.put))
-		mux.HandleFunc("DELETE /api/store/{name}", api.guard(api.delete))
+	// 本地数据文件存储 API：礼簿应用把加密快照自动备份到 <root>/data/ 目录。
+	// 无论目录是否可用都注册路由（不可用时返回 503），
+	// 否则请求会落入静态处理器返回 index.html，应用端会误判"自动备份可用"
+	api := &storeAPI{dir: filepath.Join(root, "data")}
+	if err := os.MkdirAll(api.dir, 0o755); err != nil {
+		api.disabled = true
+		fmt.Fprintf(os.Stderr, "警告：无法创建数据目录 %s：%v（自动备份不可用，应用将拒绝启动）\n", api.dir, err)
 	}
+	mux.HandleFunc("GET /api/store", api.guard(api.list))
+	mux.HandleFunc("GET /api/store/{name}", api.guard(api.get))
+	mux.HandleFunc("PUT /api/store/{name}", api.guard(api.put))
+	mux.HandleFunc("DELETE /api/store/{name}", api.guard(api.delete))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// API 路径不匹配任何已注册方法时显式 404，禁止回落到静态文件
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
 		// "/" 与 "/index.html" 直接返回文件内容。不用 http.ServeFile——它对
 		// 以 /index.html 结尾的 URL 也会做规范化 301 跳转（与静态跳转形成死循环），
 		// ServeContent 则原样返回文件
@@ -206,7 +213,16 @@ func waitExit(code int) {
 // ==================== 本地数据文件存储 API ====================
 
 type storeAPI struct {
-	dir string
+	dir      string
+	disabled bool
+}
+
+func (api *storeAPI) rejectIfDisabled(w http.ResponseWriter) bool {
+	if api.disabled {
+		jsonError(w, "data dir unavailable", http.StatusServiceUnavailable)
+		return true
+	}
+	return false
 }
 
 // guard 为 API 请求做本地安全校验：
@@ -263,6 +279,9 @@ func validName(name string) bool {
 }
 
 func (api *storeAPI) list(w http.ResponseWriter, r *http.Request) {
+	if api.rejectIfDisabled(w) {
+		return
+	}
 	entries, err := os.ReadDir(api.dir)
 	if err != nil {
 		jsonError(w, "read dir failed", http.StatusInternalServerError)
@@ -287,6 +306,9 @@ func (api *storeAPI) list(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *storeAPI) get(w http.ResponseWriter, r *http.Request) {
+	if api.rejectIfDisabled(w) {
+		return
+	}
 	name := r.PathValue("name")
 	if !validName(name) {
 		http.Error(w, "bad name", http.StatusBadRequest)
@@ -298,6 +320,9 @@ func (api *storeAPI) get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *storeAPI) put(w http.ResponseWriter, r *http.Request) {
+	if api.rejectIfDisabled(w) {
+		return
+	}
 	name := r.PathValue("name")
 	if !validName(name) {
 		http.Error(w, "bad name", http.StatusBadRequest)
@@ -335,6 +360,9 @@ func (api *storeAPI) put(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *storeAPI) delete(w http.ResponseWriter, r *http.Request) {
+	if api.rejectIfDisabled(w) {
+		return
+	}
 	name := r.PathValue("name")
 	if !validName(name) {
 		http.Error(w, "bad name", http.StatusBadRequest)
