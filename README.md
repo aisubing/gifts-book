@@ -95,10 +95,10 @@
 
 仓库 `server/` 目录附赠一个纯 Go 标准库实现的静态服务器（无任何运行时依赖）：
 
-1. 将对应平台的 `gifts-book-server-*.exe`（Release 提供，约 5MB）放到 `index.html` 旁边；
-2. 双击运行——自动启动本地服务并打开浏览器；
+1. 从 [Releases](https://github.com/aisubing/gifts-book/releases) 下载 `gifts-book-complete-*.zip`（推荐，解压即用）或单独的 `gifts-book-server-*.exe`（约 5MB）；
+2. 将服务器程序放到 `index.html` 旁边，双击运行——自动启动本地服务并打开浏览器；
 3. 端口默认 `8765`（被占用自动换空闲端口）；`-port` / `-dir` / `-addr` / `-open=false` 参数可选；
-4. 此时 **PDF-LIB.JS 引擎完整可用**（含自定义字体嵌入的精美 PDF 导出）。
+4. 此时 **PDF-LIB.JS 引擎完整可用**（含自定义字体嵌入的精美 PDF 导出），并启用**本地自动备份**。
 
 源码见 [`server/main.go`](server/main.go)，交叉编译：`cd server && ./build.sh`。
 
