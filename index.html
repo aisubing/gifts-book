@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>电子礼簿系统 - 专业版</title>
+    <link rel="icon" href="./static/favicon.ico" type="image/x-icon" />
     <script src="./static/tailwindcss.js"></script>
     <script src="./static/xlsx.full.min.js"></script>
     <script src="./static/crypto-js.min.js"></script>
@@ -718,7 +719,7 @@
                     <i class="ri-search-line text-base"></i>查找
                   </button>
                 </div>
-                <button id="print-btn" class="w-full themed-button-primary p-3 rounded-lg">打印/另存为PDF</button>
+                <button id="print-btn" class="w-full border themed-button-secondary p-3 rounded-lg">打印/另存为PDF</button>
                 <button id="export-excel-btn" class="w-full border themed-button-secondary p-3 rounded-lg">导出为 Excel</button>
                 <button id="save-now-btn" class="w-full border themed-button-secondary p-3 rounded-lg">
                   <i class="ri-save-3-line align-middle mr-1"></i>立即保存备份
@@ -762,10 +763,6 @@
       </div>
     </div>
     <div class="absolute lg:fixed top-5 right-5 flex gap-3 z-40">
-      <button id="support-btn" class="bg-white/80 backdrop-blur rounded-full p-2 shadow-sm hover:shadow-md transition-all group" title="联系/支持作者">
-        <i class="ri-heart-3-line text-2xl text-red-500 group-hover:scale-110 transition-transform block"></i>
-      </button>
-
       <button id="fullscreen-btn" class="bg-white/80 backdrop-blur rounded-full p-2 shadow-sm hover:shadow-md transition-all" title="全屏/退出全屏">
         <i id="fullscreen-icon" class="ri-fullscreen-line text-2xl themed-text themed-dropdown-text"></i>
       </button>
@@ -1338,7 +1335,6 @@
             previewCreateVoiceBtn: $("preview-create-voice-btn"),
             fullscreenBtn: $("fullscreen-btn"),
             fullscreenIcon: $("fullscreen-icon"),
-            supportBtn: $("support-btn"),
           };
         }
 
@@ -4609,57 +4605,6 @@
           }
         }
         /**
-         * 显示联系与支持作者弹窗
-         */
-        showAuthorSupportModal() {
-          // 定义样式常量
-          const containerClass = "flex flex-col md:flex-row gap-1 justify-center items-center py-4 px-2";
-          const cardClass = "text-center flex-1 w-full flex flex-col items-center";
-          const imgBoxClass = "w-48 h-48 bg-gray-50 border-2 border-dashed border-gray-300 rounded-xl flex items-center justify-center overflow-hidden mb-3 relative group transition-all hover:border-solid";
-          const imgClass = "w-full h-full object-contain p-1";
-          const wechatQrSrc = "./static/addme.jpg";
-          const payQrSrc = "./static/support.jpg";
-
-          const html = `
-          <div class="${containerClass}">
-            
-            <div class="${cardClass}">
-              <h4 class="font-bold text-lg text-gray-800 mb-1">联系作者</h4>
-              <p class="text-md text-gray-500 mb-4">反馈、功能建议 · 交流</p>
-              <div class="${imgBoxClass} hover:border-blue-400">
-                <img src="${wechatQrSrc}" alt="微信二维码" class="${imgClass}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'">
-                <div class="absolute inset-0 hidden items-center justify-center text-gray-400 bg-gray-50 text-sm">
-                  此处放微信二维码<br>(请替换图片路径)
-                </div>
-              </div>
-              <p class="text-sm font-medium text-gray-700 bg-gray-100 px-3 py-1 rounded-full mt-1">微信交流</p>
-            </div>
-
-            <div class="w-full h-px md:w-px md:h-64 bg-gray-200"></div>
-
-            <div class="${cardClass}">
-              <h4 class="font-bold text-lg text-gray-800 mb-1">打赏支持</h4>
-              <p class="text-md text-gray-500 mb-4">开源不易，请作者喝杯咖啡</p>
-
-              <div class="${imgBoxClass} hover:border-red-400">
-                <img src="${payQrSrc}" alt="收款码" class="${imgClass}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'">
-                <div class="absolute inset-0 hidden items-center justify-center text-gray-400 bg-gray-50 text-sm">
-                  此处放收款码<br>(请替换图片路径)
-                </div>
-              </div>
-              <p class="text-sm font-medium text-red-600 bg-red-50 px-3 py-1 rounded-full mt-1">感谢您的鼓励与支持 ❤️</p>
-            </div>
-
-          </div>
-          
-          <div class="text-center mt-2 p-3 bg-yellow-50 rounded-lg text-xs text-yellow-700 border border-yellow-200">
-            <i class="ri-information-line align-middle mr-1"></i>
-            本程序为开源免费程序，如果您觉得这个系统对您有帮助，欢迎联系作者提建议。
-          </div>
-        `;
-          this.ui.showModal("联系开发者", html, [{ text: "关闭", class: "themed-button-secondary border px-6 py-2 rounded-lg" }]);
-        }
-        /**
          * 绑定页面交互事件，负责表单、快捷键与辅助功能
          */
         bindEvents() {
@@ -4784,7 +4729,6 @@
               document.exitFullscreen();
             }
           });
-          this.ui.elements.supportBtn?.addEventListener("click", () => this.showAuthorSupportModal());
           document.addEventListener("fullscreenchange", () => {
             const isFullscreen = !!document.fullscreenElement;
             if (isFullscreen) {
