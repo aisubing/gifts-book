@@ -655,6 +655,15 @@
             <button type="submit" class="w-full themed-button-primary p-3 rounded-lg transition duration-300 font-bold">创建并进入</button>
           </form>
         </div>
+
+        <div class="mt-8 pt-6 border-t">
+          <h2 class="text-xl font-semibold mb-4 border-b pb-2">从备份文件导入事项</h2>
+          <button type="button" id="import-event-btn" class="w-full border themed-button-secondary p-3 rounded-lg">
+            <i class="ri-folder-upload-line mr-1"></i>选择 .bin 备份文件导入
+          </button>
+          <input type="file" id="import-event-file" accept=".bin" class="hidden" />
+          <p class="text-xs text-gray-500 mt-2">支持本系统导出的 BIN 备份文件。导入时需输入该备份的管理密码，导入后事项密码与备份时一致，并自动进入事项。</p>
+        </div>
       </div>
 
       <!-- 主界面 -->
@@ -1289,6 +1298,8 @@
             eventSelector: $("event-selector"),
             unlockEventBtn: $("unlock-event-btn"),
             createEventForm: $("create-event-form"),
+            importEventBtn: $("import-event-btn"),
+            importEventFile: $("import-event-file"),
             addGiftForm: $("add-gift-form"),
             giftBookContent: $("gift-book-content"),
             totalAmountEl: $("total-amount"),
@@ -4654,6 +4665,12 @@
         bindEvents() {
           // 表单提交事件
           this.ui.elements.createEventForm.addEventListener("submit", (e) => this.handleCreateEvent(e));
+          this.ui.elements.importEventBtn.addEventListener("click", () => this.ui.elements.importEventFile.click());
+          this.ui.elements.importEventFile.addEventListener("change", (e) => {
+            const file = e.target.files?.[0];
+            e.target.value = ""; // 允许重复选择同一文件
+            if (file) this.importEventFromBackupFile(file);
+          });
           this.ui.elements.addGiftForm.addEventListener("submit", (e) => this.handleAddGift(e));
           this.ui.elements.unlockEventBtn.addEventListener("click", () => {
             const eventId = parseInt(this.ui.elements.eventSelector.value, 10);
@@ -5001,6 +5018,124 @@
           ]);
 
           setTimeout(() => document.getElementById("verify-create-pwd")?.focus(), 50);
+        }
+
+        /**
+         * 从 BIN 备份文件导入为一个新事项（创建事项页入口）
+         * 流程：选择文件 → 询问备份管理密码 → 解密校验（密码正确即解密成功）
+         * → 以该密码创建新事项并写入礼金（密文无需重加密）→ 自动进入事项
+         * @param {File} file - 本系统导出的 .bin 备份文件
+         */
+        async importEventFromBackupFile(file) {
+          try {
+            const MAGIC_HEADER = [0x45, 0x47, 0x4c, 0x42]; // "EGLB"
+            const HEADER_LENGTH = 8;
+            const FILE_VERSION = 1;
+
+            // 步骤1：校验文件格式（无需密码）
+            const fileBytes = new Uint8Array(await file.arrayBuffer());
+            if (fileBytes.length < HEADER_LENGTH || fileBytes[0] !== MAGIC_HEADER[0] || fileBytes[1] !== MAGIC_HEADER[1] || fileBytes[2] !== MAGIC_HEADER[2] || fileBytes[3] !== MAGIC_HEADER[3]) {
+              this.ui.showNotification("文件格式错误：不是有效的 BIN 备份文件。", "error");
+              return;
+            }
+            if (fileBytes[4] > FILE_VERSION) {
+              this.ui.showNotification(`文件版本 (v${fileBytes[4]}) 过高，请升级系统后再导入。`, "error");
+              return;
+            }
+
+            // 步骤2：询问备份文件的管理密码（校验方式：能否成功解密）
+            const password = await new Promise((resolve) => {
+              const content = `
+                            <p class="text-sm text-gray-600 mb-3">请输入该备份文件的管理密码（导入后事项密码与备份时一致）：</p>
+                            <input type="password" id="import-event-pwd" class="w-full p-2 border rounded themed-ring" placeholder="备份文件的管理密码">
+                          `;
+              let settled = false;
+              const settle = (value) => {
+                if (settled) return;
+                settled = true;
+                resolve(value);
+              };
+              this.ui.showModal(
+                "导入事项",
+                content,
+                [
+                  { text: "取消", class: "themed-button-secondary border px-4 py-2 rounded", handler: () => settle(null) },
+                  {
+                    text: "导入",
+                    class: "themed-button-primary px-4 py-2 rounded",
+                    keepOpen: true,
+                    handler: () => {
+                      const pwd = document.getElementById("import-event-pwd").value;
+                      if (!pwd) return this.ui.showNotification("请输入管理密码。", "error");
+                      settle(pwd);
+                      this.ui.closeModal();
+                    },
+                  },
+                ],
+                { onClose: () => settle(null) }
+              );
+              setTimeout(() => document.getElementById("import-event-pwd")?.focus(), 50);
+            });
+            if (password === null) return;
+
+            this.ui.showNotification("正在导入，请稍候…", "info");
+
+            // 步骤3：解密并解析
+            const payloadBytes = fileBytes.slice(HEADER_LENGTH);
+            let binaryString = "";
+            const chunkSize = 0x8000;
+            for (let i = 0; i < payloadBytes.length; i += chunkSize) {
+              binaryString += String.fromCharCode(...payloadBytes.subarray(i, i + chunkSize));
+            }
+            const decrypted = CryptoService.decrypt(btoa(binaryString), password);
+            if (!decrypted) {
+              this.ui.showNotification("解密失败：管理密码错误或文件已损坏。", "error");
+              return;
+            }
+            const payload = JSON.parse(decrypted);
+            const eventSnapshot = payload?.event || {};
+            const giftRecords = Array.isArray(payload?.gifts) ? payload.gifts : [];
+
+            // 步骤4：以备份密码作为新事项密码创建事项
+            const { date } = Utils.getCurrentDateTime();
+            const newEvent = {
+              name: eventSnapshot.name || `导入事项_${date}`,
+              startDateTime: eventSnapshot.startDateTime || `${date}T00:00`,
+              endDateTime: eventSnapshot.endDateTime || `${date}T23:59`,
+              passwordHash: CryptoService.hash(password),
+              theme: eventSnapshot.theme || "theme-festive",
+              voiceName: eventSnapshot.voiceName || "",
+              coverType: eventSnapshot.coverType || "default",
+              recorder: eventSnapshot.recorder || "",
+              minSpeechAmount: eventSnapshot.minSpeechAmount ?? 0,
+              hidePrivacy: eventSnapshot.hidePrivacy || false,
+              printOptions: { ...DEFAULT_PRINT_OPTIONS, ...(eventSnapshot.printOptions || {}) },
+            };
+            if (eventSnapshot.itemsPerPage) newEvent.itemsPerPage = eventSnapshot.itemsPerPage;
+            if (eventSnapshot.customStyle) newEvent.customStyle = eventSnapshot.customStyle;
+
+            const newEventId = await this.giftRepository.createEvent(newEvent);
+
+            // 步骤5：写入礼金记录——密文用同一密码加密，直接原样入库（无需重加密）
+            const recordsToImport = giftRecords
+              .filter((r) => r.encryptedData)
+              .map((r) => ({
+                encryptedData: r.encryptedData,
+                guestLevelWeight: r.guestLevelWeight ?? 0,
+                levelUpdateTime: r.levelUpdateTime ?? 0,
+              }));
+            await this.dbManager.replaceGiftsForEvent(newEventId, recordsToImport, false);
+
+            this.ui.showNotification(`事项"${Utils.escapeHtml(newEvent.name)}"导入成功，共 ${recordsToImport.length} 条礼金记录。`, "success");
+
+            // 步骤6：自动进入导入的事项
+            this.currentEvent = { ...newEvent, id: newEventId };
+            this.currentPassword = password;
+            await this.startSession();
+          } catch (error) {
+            console.error("导入事项失败:", error);
+            this.ui.showNotification("导入失败：文件可能已损坏。", "error");
+          }
         }
 
         /**
