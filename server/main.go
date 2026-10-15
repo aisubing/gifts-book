@@ -284,8 +284,14 @@ func (api *storeAPI) list(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, err := os.ReadDir(api.dir)
 	if err != nil {
-		jsonError(w, "read dir failed", http.StatusInternalServerError)
-		return
+		// 数据目录被意外删除（如手动清理）时自动重建，避免应用端误判为服务不可用
+		if os.MkdirAll(api.dir, 0o755) == nil {
+			entries, err = os.ReadDir(api.dir)
+		}
+		if err != nil {
+			jsonError(w, "read dir failed", http.StatusInternalServerError)
+			return
+		}
 	}
 	files := make([]map[string]any, 0, len(entries))
 	for _, e := range entries {

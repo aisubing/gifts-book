@@ -704,11 +704,16 @@
               <h3 class="text-xl font-semibold mb-3">功能区</h3>
               <div class="space-y-3">
                 <div class="relative">
-                  <input type="text" id="search-name" placeholder="按姓名查找..." class="w-full p-3 border rounded-lg focus:ring-2 themed-ring pr-10" />
-                  <i id="search-icon" class="ri-search-line text-xl absolute right-3 top-3 text-gray-400 cursor-pointer"></i>
+                  <input type="text" id="search-name" placeholder="输入姓名进行查找" class="w-full p-3 border rounded-lg focus:ring-2 themed-ring pr-20" />
+                  <button id="search-icon" type="button" class="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 text-sm font-medium text-gray-600 bg-gray-50 border border-gray-200 rounded px-2 py-1 cursor-pointer hover:bg-gray-100">
+                    <i class="ri-search-line text-base"></i>查找
+                  </button>
                 </div>
                 <button id="print-btn" class="w-full themed-button-primary p-3 rounded-lg">打印/另存为PDF</button>
                 <button id="export-excel-btn" class="w-full border themed-button-secondary p-3 rounded-lg">导出为 Excel</button>
+                <button id="save-now-btn" class="w-full border themed-button-secondary p-3 rounded-lg">
+                  <i class="ri-save-3-line align-middle mr-1"></i>立即保存备份
+                </button>
                 <button id="stats-btn" class="w-full themed-button-primary p-3 rounded-lg">查看统计</button>
                 <div class="flex items-center justify-between bg-gray-100 p-3 rounded-lg">
                   <span class="font-medium text-gray-700">语音播报</span>
@@ -1298,6 +1303,7 @@
             printBtn: $("print-btn"),
             exportExcelBtn: $("export-excel-btn"),
             statsBtn: $("stats-btn"),
+            saveNowBtn: $("save-now-btn"),
             searchNameInput: $("search-name"),
             searchIcon: $("search-icon"),
             selectEventSection: $("select-event-section"),
@@ -4222,6 +4228,16 @@
           }
         }
 
+        /**
+         * 立即落盘（"立即保存备份"按钮）：冲刷新防抖队列并强制保存当前事项
+         * @returns {Promise<boolean>} 是否保存成功
+         */
+        async saveNow() {
+          clearTimeout(this.debounceTimer);
+          this.pendingEventIds.clear();
+          return this.saveCurrentEvent();
+        }
+
         buildFilename(event) {
           const safeName = (event.name || "event").replace(/[\\/:*?"<>|\s]/g, "_").slice(0, 60);
           return `${safeName}_event${event.id}.bin`;
@@ -4662,6 +4678,7 @@
           this.ui.elements.printBtn.addEventListener("click", () => this.exportService.prepareForPrint());
           this.ui.elements.exportExcelBtn.addEventListener("click", () => this.exportService.exportToExcel());
           this.ui.elements.statsBtn.addEventListener("click", () => this.statsService.showStatistics());
+          this.ui.elements.saveNowBtn.addEventListener("click", () => this.saveNow());
           this.ui.elements.searchIcon.addEventListener("click", () => this.handleSearch());
           this.ui.elements.searchNameInput.addEventListener("keyup", (e) => e.key === "Enter" && this.handleSearch());
 
@@ -5085,6 +5102,25 @@
             { text: "返回修改", class: "themed-button-secondary border px-4 py-2 rounded" },
             { text: "确认提交", class: "themed-button-primary px-4 py-2 rounded", handler: confirmationHandler, keepOpen: true },
           ]);
+        }
+
+        /**
+         * 立即保存备份（手动触发数据落盘，不等待 3 秒防抖）
+         */
+        async saveNow() {
+          const btn = this.ui.elements.saveNowBtn;
+          if (btn.disabled) return;
+          btn.disabled = true;
+          try {
+            const ok = await this.autoBackup.saveNow();
+            if (ok) {
+              this.ui.showNotification(`已保存到本地备份文件（${new Date().toLocaleTimeString("zh-CN")}）。`, "success");
+            } else {
+              this.ui.showNotification(`保存失败：${this.autoBackup.lastError || "未知原因"}`, "error");
+            }
+          } finally {
+            btn.disabled = false;
+          }
         }
 
         /**
