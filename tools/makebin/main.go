@@ -497,9 +497,10 @@ func readXlsxGrid(path string) ([][]string, error) {
 	if target == "" {
 		return nil, errors.New("xlsx 工作表关系缺失")
 	}
-	sheetPath := target
+	// 兼容相对路径（worksheets/sheet1.xml）与绝对路径（/xl/worksheets/sheet1.xml，openpyxl/WPS 常见）
+	sheetPath := strings.TrimPrefix(target, "/")
 	if !strings.HasPrefix(sheetPath, "xl/") {
-		sheetPath = "xl/" + strings.TrimPrefix(sheetPath, "/")
+		sheetPath = "xl/" + sheetPath
 	}
 
 	// 3. sharedStrings.xml → 共享字符串表
