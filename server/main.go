@@ -261,17 +261,33 @@ func isLocalHost(h string) bool {
 	return h == "127.0.0.1" || h == "localhost" || h == "::1"
 }
 
-// validName 限制文件名字符集（字母/数字/汉字/._-），杜绝路径穿越
+// validName 校验备份文件名的合法性。
+// 采用"仅拒绝危险项"策略：路径穿越、路径分隔符、Windows 文件名非法字符、
+// 控制字符、Windows 保留设备名、结尾的点/空格，其余字符（全角标点、括号、
+// 空格等事项名可能出现的内容）一律放行，保证各类事项名都能落盘备份。
+// 注意 250 字节上限需同时满足 Linux 文件系统单文件名 255 字节限制与 UTF-8 中文占用
 func validName(name string) bool {
-	if name == "" || len(name) > 120 || strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
+	if name == "" || len(name) > 250 || strings.Contains(name, "..") {
+		return false
+	}
+	if strings.ContainsAny(name, `/\:*?"<>|`) {
+		return false
+	}
+	if strings.TrimRight(name, ". ") != name { // Windows 会忽略结尾的点/空格
+		return false
+	}
+	stem := strings.ToUpper(name)
+	if i := strings.IndexByte(stem, '.'); i >= 0 {
+		stem = stem[:i]
+	}
+	switch stem { // Windows 保留设备名
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
 		return false
 	}
 	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		case r == '.' || r == '_' || r == '-':
-		case r >= 0x4e00 && r <= 0x9fff: // 汉字
-		default:
+		if r < 0x20 || r == 0x7f { // 控制字符
 			return false
 		}
 	}
