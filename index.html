@@ -4258,8 +4258,14 @@
             const filename = this.buildFilename(app.currentEvent);
             const r = await fetch(`${this.apiBase}/${encodeURIComponent(filename)}`, { method: "PUT", body: bytes });
             if (!r.ok) throw new Error("HTTP " + r.status);
-            // 事项改名后清理同 ID 的旧文件，避免残留重复
-            await this.removeFilesForEvent(app.currentEvent.id, filename);
+            // 事项改名后清理本端用过的旧文件名，避免残留重复。
+            // data/ 目录可能被多端共享、事项 ID 各端都从 1 起算，清理必须按文件名限定而非仅 ID，
+            // 否则会误删他端同名 ID 事项的备份
+            const rec = this.getBackupNameRecord(app.currentEvent.id);
+            if (rec.current && rec.current !== filename && !rec.legacy.includes(rec.current)) rec.legacy.push(rec.current);
+            rec.current = filename;
+            this.setBackupNameRecord(app.currentEvent.id, rec);
+            await this.removeFilesForEvent(app.currentEvent, filename, rec.legacy);
             this.lastSavedAt = new Date();
             this.lastError = null;
             return true;
@@ -4290,13 +4296,52 @@
           }
         }
 
-        /** 删除某事项 ID 对应的全部备份文件（keepFilename 除外） */
-        async removeFilesForEvent(eventId, keepFilename = null) {
-          if (!this.available) return;
+        /**
+         * 本端备份文件名登记（localStorage，随浏览器配置隔离）：记录各事项当前与
+         * 历史用过的备份文件名。data/ 目录可能被多端共享，清理时只信本端亲自
+         * 写过的文件名，避免按事项 ID 误删他端同名 ID 事项的备份
+         */
+        getBackupNameRecord(eventId) {
+          try {
+            const all = JSON.parse(localStorage.getItem("autoBackupNames") || "{}");
+            return all[eventId] || { current: null, legacy: [] };
+          } catch (e) {
+            return { current: null, legacy: [] };
+          }
+        }
+
+        setBackupNameRecord(eventId, record) {
+          try {
+            const all = JSON.parse(localStorage.getItem("autoBackupNames") || "{}");
+            if (record) all[eventId] = record;
+            else delete all[eventId];
+            localStorage.setItem("autoBackupNames", JSON.stringify(all));
+          } catch (e) {
+            /* 尽力而为（隐私模式等 localStorage 不可用时退化为仅按名前缀清理） */
+          }
+        }
+
+        /**
+         * 删除指定事项的本地备份文件（keepFilename 除外）。
+         * 清理范围 = 「当前事项名 + ID」前缀吻合的文件 ∪ 本端登记过的历史文件名。
+         * 不做纯 ID 匹配：data/ 目录可能被多个浏览器配置/多台设备共享，事项 ID
+         * 在各端都从 1 起算，单按 "_eventID." 匹配会误删他端同名 ID 事项的备份
+         * @param {{id: number, name: string}} event - 目标事项（含 id 与名称）
+         * @param {string} [keepFilename] - 保留不删的文件名（如刚写入的新快照）
+         * @param {string[]} [legacyNames] - 本端登记过的历史文件名（改名遗留等）
+         */
+        async removeFilesForEvent(event, keepFilename = null, legacyNames = []) {
+          if (!this.available || !event || event.id === undefined) return;
           try {
             const { files } = await this.list();
-            const pattern = new RegExp(`_event${eventId}\\.`);
-            await Promise.all(files.filter((f) => pattern.test(f.name) && f.name !== keepFilename).map((f) => this.deleteFile(f.name)));
+            const stem = this.buildFilename(event).replace(/\.bin$/, "");
+            const pattern = new RegExp(`^${stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.`);
+            const legacy = new Set(legacyNames);
+            await Promise.all(
+              files
+                .filter((f) => (pattern.test(f.name) || legacy.has(f.name)) && f.name !== keepFilename)
+                .map((f) => this.deleteFile(f.name))
+            );
           } catch (e) {
             /* 尽力而为 */
           }
@@ -7016,7 +7061,9 @@
               await this.giftRepository.deleteEvent(eventId);
               this.session.clear();
               this.passwordCache.clear(eventId);
-              await this.autoBackup.removeFilesForEvent(eventId); // 同步清理本地备份文件
+              const rec = this.autoBackup.getBackupNameRecord(eventId);
+              await this.autoBackup.removeFilesForEvent(this.currentEvent, null, rec.legacy); // 同步清理本地备份文件（按事项名+本端登记的旧名限定）
+              this.autoBackup.setBackupNameRecord(eventId, null);
               this.ui.showNotification(`事项 "${Utils.escapeHtml(this.currentEvent.name)}" 已被成功删除。`, "success");
 
               setTimeout(() => {
@@ -7103,7 +7150,9 @@
 
                   this.session.clear();
                   this.passwordCache.clear(eventId);
-                  await this.autoBackup.removeFilesForEvent(eventId); // 同步清理本地备份文件
+                  const rec = this.autoBackup.getBackupNameRecord(eventId);
+                  await this.autoBackup.removeFilesForEvent(this.currentEvent, null, rec.legacy); // 同步清理本地备份文件（按事项名+本端登记的旧名限定）
+                  this.autoBackup.setBackupNameRecord(eventId, null);
                   this.ui.showNotification(`事项 "${Utils.escapeHtml(this.currentEvent.name)}" 已被成功删除。`, "success");
 
                   setTimeout(() => {
