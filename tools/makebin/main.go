@@ -694,7 +694,12 @@ func prefix(s []string, n int) []string {
 func prompt(reader *bufio.Reader, label string) string {
 	fmt.Print(label)
 	line, _ := reader.ReadString('\n')
-	return strings.TrimSpace(line)
+	s := strings.TrimSpace(line)
+	// Windows 下拖入含空格的文件路径时，cmd 会自动为路径包上一层英文引号，须去掉
+	if len(s) >= 2 && s[0] == s[len(s)-1] && (s[0] == '"' || s[0] == '\'') {
+		s = s[1 : len(s)-1]
+	}
+	return strings.TrimSpace(s)
 }
 
 func runInteractive() error {
